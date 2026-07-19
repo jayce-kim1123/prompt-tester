@@ -173,29 +173,38 @@ struct SavedLibrary: Codable {
 
 struct EvaluationInput: Codable {
     let prompt: String
+    let evaluationPrompt: String?
     let provider: String
     let model: String
     let rows: [DatasetRow]
     let datasetName: String?
     let sourceDatasetName: String?
     let promptName: String?
+    let testCaseName: String?
+    let criteria: [TestCriterionDefinition]?
 
     init(
         prompt: String,
+        evaluationPrompt: String? = nil,
         provider: String,
         model: String,
         rows: [DatasetRow],
         datasetName: String? = nil,
         sourceDatasetName: String? = nil,
-        promptName: String? = nil
+        promptName: String? = nil,
+        testCaseName: String? = nil,
+        criteria: [TestCriterionDefinition]? = nil
     ) {
         self.prompt = prompt
+        self.evaluationPrompt = evaluationPrompt
         self.provider = provider
         self.model = model
         self.rows = rows
         self.datasetName = datasetName
         self.sourceDatasetName = sourceDatasetName
         self.promptName = promptName
+        self.testCaseName = testCaseName
+        self.criteria = criteria
     }
 }
 

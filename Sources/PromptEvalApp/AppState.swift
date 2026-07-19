@@ -72,6 +72,26 @@ final class AppState: ObservableObject {
         "gpt-5.4-mini",
         "gpt-5.3-codex",
     ]
+    private static let defaultEvaluationPrompt = """
+    당신은 엄격하고 공정한 LLM 출력 평가자입니다.
+
+    실제 LLM 입력:
+    {{llm_input}}
+
+    원본 프롬프트:
+    {{original_prompt}}
+
+    데이터셋 값과 기댓값:
+    {{dataset_values}}
+
+    저장된 테스트 기준:
+    {{test_criteria}}
+
+    모델 출력:
+    {{model_output}}
+
+    모델 출력이 원본 프롬프트를 따르고 정확하며 일관되고 유용한지 평가하세요. 저장된 테스트 기준이 있으면 각 기준의 기댓값, 추출 결과, PASS 규칙, 결정적 판정도 함께 검토하세요. 저장된 테스트 기준이 없으면 기준을 임의로 만들지 마세요. 전체 통과 여부와 0~100 점수, 그리고 구체적인 근거를 판단하세요. 모든 근거와 기준별 근거는 한국어로 작성하세요.
+    """
 
     @Published var promptText = ""
     @Published var promptName = "새 프롬프트"
@@ -82,10 +102,18 @@ final class AppState: ObservableObject {
     @Published var selectedDatasetID: UUID?
     @Published var headers: [String] = []
     @Published var rows: [DatasetRow] = []
-    @Published var provider: ProviderKind = .gemini
+    @Published var provider: ProviderKind = .gemini {
+        didSet { UserDefaults.standard.set(provider.rawValue, forKey: "lastLLMProvider") }
+    }
     @Published var providerAPIKey = ""
     @Published var models: [ModelOption] = []
-    @Published var selectedModelID = ""
+    @Published var selectedModelID = "" {
+        didSet {
+            let modelID = selectedModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !modelID.isEmpty else { return }
+            UserDefaults.standard.set(modelID, forKey: "lastLLMModelID")
+        }
+    }
     @Published var spreadsheetID = ""
     @Published var spreadsheetRange = "Sheet1!A:ZZ"
     @Published var googleAPIKey = ""
@@ -102,22 +130,48 @@ final class AppState: ObservableObject {
     @Published var codexEvaluationModel = "gpt-5.5" {
         didSet { UserDefaults.standard.set(codexEvaluationModel, forKey: "codexEvaluationModel") }
     }
+    @Published var evaluationPrompt = AppState.defaultEvaluationPrompt {
+        didSet { UserDefaults.standard.set(evaluationPrompt, forKey: "evaluationPrompt") }
+    }
+    // Promptfoo API keys are intentionally memory-only. Evaluation logs must not contain credentials.
+    @Published var promptfooAPIKey = ""
     @Published var isLoadingModels = false
     @Published var isRunning = false
     @Published var isEvaluating = false
+    @Published var isRecommendingEvaluationPrompt = false
+    @Published var isSharingEvaluation = false
     @Published var progress = 0
+    @Published var evaluationProgress = 0
+    @Published var evaluationTotal = 0
     @Published var status = "프롬프트와 데이터셋을 불러오세요."
     @Published var evaluationBundleURL: URL?
     @Published var evaluationSummary: EvaluationRunSummary?
     @Published var evaluationResults: [EvaluationResultRecord] = []
     @Published var selectedEvaluationResultID: String?
+    @Published var savedTestCases: [SavedTestCase] = []
+    @Published var selectedTestCaseID: UUID?
+    @Published var testCaseName = "새 테스트 케이스"
+    @Published var testCaseCriteria: [TestCriterionDefinition] = []
+    @Published var sampleOutput: LLMOutputRecord?
+    @Published var criteriaPreviewOutputs: [LLMOutputRecord] = []
+    @Published var isPreviewingTestCase = false
+    @Published var isRunningCriteriaPreview = false
+    @Published var criteriaPreviewProgress = 0
+    @Published var isRecommendingCriteria = false
+    @Published var testRuns: [SavedTestRun] = []
+    @Published var selectedTestRunID: UUID?
+    @Published var testRunLimit = 0
+    @Published var isTestRunning = false
     @Published var alertMessage: String?
+
+    private var activeTestRunTask: Task<Void, Never>?
 
     var promptVariables: [String] { PromptTemplate.variables(in: promptText) }
     var missingVariables: [String] { promptVariables.filter { !headers.contains($0) } }
     var completedCount: Int { rows.filter { $0.output != nil }.count }
     var selectedModelName: String { models.first(where: { $0.id == selectedModelID })?.name ?? selectedModelID }
     var selectedDataset: SavedDataset? { savedDatasets.first(where: { $0.id == selectedDatasetID }) }
+    var sourceDatasets: [SavedDataset] { savedDatasets.filter { $0.kind == .source } }
     var isEvaluationDatasetSelected: Bool { selectedDataset?.kind == .evaluation }
     var selectedEvaluationResult: EvaluationResultRecord? {
         evaluationResults.first(where: { $0.id == selectedEvaluationResultID })
@@ -129,19 +183,49 @@ final class AppState: ObservableObject {
         }
         return [current] + Self.knownCodexEvaluationModels
     }
+    var selectedTestCase: SavedTestCase? { savedTestCases.first { $0.id == selectedTestCaseID } }
+    var selectedTestRun: SavedTestRun? { testRuns.first { $0.id == selectedTestRunID } }
+    var testCaseExpectedFields: [String] { headers.filter { !promptVariables.contains($0) } }
+    var sampleOutputPaths: [String] { sampleOutput?.output.map(JSONValueExtractor.paths) ?? [] }
+    var criteriaPreviews: [TestCaseCriteriaPreview] {
+        criteriaPreviewOutputs.compactMap { output in
+            guard let row = rows.first(where: { $0.id == output.rowID }) else { return nil }
+            return TestCaseCriteriaPreview(row: row, output: output)
+        }
+    }
+
+    func arrayObjectFields(at path: String) -> [String] {
+        guard let output = sampleOutput?.output else { return [] }
+        return JSONValueExtractor.objectFields(atArrayPath: path, in: output)
+    }
+
+    func arrayObjectValues(at path: String, field: String) -> [String] {
+        guard let output = sampleOutput?.output else { return [] }
+        return JSONValueExtractor.objectValues(atArrayPath: path, field: field, in: output)
+    }
 
     init() {
+        if let savedProvider = UserDefaults.standard.string(forKey: "lastLLMProvider"),
+           let savedProviderKind = ProviderKind(rawValue: savedProvider) {
+            provider = savedProviderKind
+        }
+        if let savedModel = UserDefaults.standard.string(forKey: "lastLLMModelID"), !savedModel.isEmpty {
+            selectedModelID = savedModel
+        }
         if UserDefaults.standard.object(forKey: "generationConcurrency") != nil {
             generationConcurrency = min(max(UserDefaults.standard.integer(forKey: "generationConcurrency"), 1), 16)
         }
         if UserDefaults.standard.object(forKey: "codexConcurrency") != nil {
-            codexConcurrency = min(max(UserDefaults.standard.integer(forKey: "codexConcurrency"), 2), 4)
+            codexConcurrency = min(max(UserDefaults.standard.integer(forKey: "codexConcurrency"), 2), 8)
         }
         if UserDefaults.standard.object(forKey: "codexJudgeLimit") != nil {
             codexJudgeLimit = max(UserDefaults.standard.integer(forKey: "codexJudgeLimit"), 0)
         }
         if let savedModel = UserDefaults.standard.string(forKey: "codexEvaluationModel"), !savedModel.isEmpty {
             codexEvaluationModel = savedModel
+        }
+        if let savedEvaluationPrompt = UserDefaults.standard.string(forKey: "evaluationPrompt"), !savedEvaluationPrompt.isEmpty {
+            evaluationPrompt = savedEvaluationPrompt
         }
         do {
             let library = try LibraryStore.load()
@@ -159,7 +243,7 @@ final class AppState: ObservableObject {
                 promptName = prompt.name
                 promptText = prompt.content
             }
-            if let dataset = savedDatasets.first {
+            if let dataset = savedDatasets.first(where: { $0.kind == .source }) {
                 selectedDatasetID = dataset.id
                 datasetName = dataset.name
                 headers = dataset.headers
@@ -172,6 +256,29 @@ final class AppState: ObservableObject {
             }
         } catch {
             status = "저장 라이브러리를 불러오지 못했습니다: \(error.localizedDescription)"
+        }
+        do {
+            savedTestCases = try TestCaseStore.load().sorted { $0.updatedAt > $1.updatedAt }
+            testRuns = try TestRunStore.loadAll()
+            if let testCase = savedTestCases.first {
+                selectTestCase(testCase.id)
+            }
+            selectedTestRunID = testRuns.first?.id
+        } catch {
+            status = "테스트 워크플로를 불러오지 못했습니다: \(error.localizedDescription)"
+        }
+        if let savedProvider = UserDefaults.standard.string(forKey: "lastLLMProvider"),
+           let savedProviderKind = ProviderKind(rawValue: savedProvider) {
+            provider = savedProviderKind
+        }
+        if let savedModel = UserDefaults.standard.string(forKey: "lastLLMModelID"), !savedModel.isEmpty {
+            selectedModelID = savedModel
+        }
+        if let savedEvaluationModel = UserDefaults.standard.string(forKey: "codexEvaluationModel"), !savedEvaluationModel.isEmpty {
+            codexEvaluationModel = savedEvaluationModel
+        }
+        if let savedEvaluationPrompt = UserDefaults.standard.string(forKey: "evaluationPrompt"), !savedEvaluationPrompt.isEmpty {
+            evaluationPrompt = savedEvaluationPrompt
         }
         refreshEvaluationResults(silent: true)
     }
@@ -291,9 +398,6 @@ final class AppState: ObservableObject {
         }
         guard let id else { return }
         guard id != selectedDatasetID else { return }
-        if selectedDatasetID != nil {
-            saveCurrentDataset(silent: true)
-        }
         evaluationBundleURL = nil
         evaluationSummary = nil
         selectedDatasetID = id
@@ -305,43 +409,13 @@ final class AppState: ObservableObject {
     }
 
     func saveCurrentDataset(silent: Bool = false) {
-        guard !isRunning else {
-            if !silent { status = "출력 생성이 끝난 뒤 데이터셋을 저장할 수 있습니다." }
-            return
+        if !silent {
+            status = "데이터셋은 읽기 전용입니다. 수정본은 파일을 새로 가져와 등록하세요."
         }
-        let name = datasetName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            if !silent { status = "데이터셋 이름을 입력하세요." }
-            return
-        }
-        if let id = selectedDatasetID, let index = savedDatasets.firstIndex(where: { $0.id == id }) {
-            savedDatasets[index].name = name
-            savedDatasets[index].updateContents(headers: headers, rows: rows)
-        } else {
-            let dataset = SavedDataset(name: name, headers: headers, rows: rows, fileExtension: "json")
-            savedDatasets.insert(dataset, at: 0)
-            selectedDatasetID = dataset.id
-        }
-        persistLibrary()
-        if !silent { status = "데이터셋을 저장했습니다: \(name)" }
     }
 
     func newDataset() {
-        guard !isRunning else {
-            status = "출력 생성이 끝난 뒤 새 데이터셋을 만들 수 있습니다."
-            return
-        }
-        if selectedDatasetID != nil {
-            saveCurrentDataset(silent: true)
-        }
-        let dataset = SavedDataset(name: "새 데이터셋", headers: [], rows: [], fileExtension: "json")
-        savedDatasets.insert(dataset, at: 0)
-        selectedDatasetID = dataset.id
-        datasetName = dataset.name
-        headers = []
-        rows = []
-        persistLibrary()
-        status = "새 데이터셋을 만들었습니다. 파일을 가져오거나 이름을 변경할 수 있습니다."
+        status = "데이터셋은 CSV 또는 JSON 파일을 가져와 등록하세요."
     }
 
     func deleteSelectedDataset() {
@@ -386,12 +460,459 @@ final class AppState: ObservableObject {
                 status = "\(provider.rawValue) 모델을 불러오는 중..."
                 let loaded = try await LLMService.models(provider: provider, apiKey: providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines))
                 models = loaded
-                selectedModelID = loaded.first?.id ?? ""
+                if !loaded.contains(where: { $0.id == selectedModelID }) {
+                    selectedModelID = loaded.first?.id ?? ""
+                }
                 status = "모델 \(loaded.count)개를 불러왔습니다."
             } catch {
                 status = error.localizedDescription
             }
             isLoadingModels = false
+        }
+    }
+
+    func newTestCase() {
+        selectedTestCaseID = nil
+        testCaseName = "새 테스트 케이스"
+        testCaseCriteria = []
+        sampleOutput = nil
+        criteriaPreviewOutputs = []
+        status = "프롬프트와 원본 데이터셋을 선택해 테스트 케이스를 만드세요."
+    }
+
+    func selectTestCase(_ id: UUID?) {
+        guard !isTestRunning, let id, let testCase = savedTestCases.first(where: { $0.id == id }) else { return }
+        selectedTestCaseID = id
+        testCaseName = testCase.name
+        testCaseCriteria = testCase.criteria.map { $0.withDefaultArrayAssertions() }
+        codexEvaluationModel = testCase.recommendationModel
+        provider = ProviderKind(rawValue: testCase.provider) ?? .gemini
+        selectedModelID = testCase.modelID
+        if let prompt = savedPrompts.first(where: { $0.id == testCase.promptID }) {
+            selectedPromptID = prompt.id
+            promptName = prompt.name
+            promptText = prompt.content
+        } else {
+            selectedPromptID = testCase.promptID
+            promptName = testCase.promptName
+            promptText = testCase.prompt
+        }
+        if let dataset = savedDatasets.first(where: { $0.id == testCase.datasetID }) {
+            selectedDatasetID = dataset.id
+            datasetName = dataset.name
+            headers = dataset.headers
+            rows = dataset.rows
+            testRunLimit = dataset.rows.count
+        }
+        if let outputID = testCase.sampleOutputID {
+            sampleOutput = try? LLMOutputStore.load(id: outputID)
+        } else {
+            sampleOutput = nil
+        }
+        criteriaPreviewOutputs = (testCase.samplePreviewOutputIDs ?? []).compactMap {
+            try? LLMOutputStore.load(id: $0)
+        }
+        status = "테스트 케이스를 불러왔습니다: \(testCase.name)"
+    }
+
+    func saveCurrentTestCase() {
+        guard let promptID = selectedPromptID,
+              let prompt = savedPrompts.first(where: { $0.id == promptID }) else {
+            status = "저장된 프롬프트를 선택하세요."
+            return
+        }
+        guard let datasetID = selectedDatasetID,
+              let dataset = savedDatasets.first(where: { $0.id == datasetID && $0.kind == .source }) else {
+            status = "원본 데이터셋을 선택하세요."
+            return
+        }
+        let name = testCaseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !selectedModelID.isEmpty else {
+            status = "테스트 케이스 이름과 실행 모델을 설정하세요."
+            return
+        }
+        let now = Date()
+        if let id = selectedTestCaseID, let index = savedTestCases.firstIndex(where: { $0.id == id }) {
+            savedTestCases[index].name = name
+            savedTestCases[index].promptID = prompt.id
+            savedTestCases[index].promptName = prompt.name
+            savedTestCases[index].prompt = prompt.content
+            savedTestCases[index].datasetID = dataset.id
+            savedTestCases[index].datasetName = dataset.name
+            savedTestCases[index].provider = provider.rawValue
+            savedTestCases[index].modelID = selectedModelID
+            savedTestCases[index].recommendationModel = codexEvaluationModel
+            savedTestCases[index].criteria = testCaseCriteria
+            savedTestCases[index].sampleRowID = rows.first?.id
+            savedTestCases[index].sampleOutputID = sampleOutput?.id
+            savedTestCases[index].samplePreviewOutputIDs = criteriaPreviewOutputs.isEmpty
+                ? nil
+                : criteriaPreviewOutputs.map(\.id)
+            savedTestCases[index].updatedAt = now
+        } else {
+            let testCase = SavedTestCase(
+                name: name,
+                promptID: prompt.id,
+                promptName: prompt.name,
+                prompt: prompt.content,
+                datasetID: dataset.id,
+                datasetName: dataset.name,
+                provider: provider.rawValue,
+                modelID: selectedModelID,
+                recommendationModel: codexEvaluationModel,
+                criteria: testCaseCriteria,
+                sampleRowID: rows.first?.id,
+                sampleOutputID: sampleOutput?.id,
+                samplePreviewOutputIDs: criteriaPreviewOutputs.isEmpty ? nil : criteriaPreviewOutputs.map(\.id)
+            )
+            savedTestCases.insert(testCase, at: 0)
+            selectedTestCaseID = testCase.id
+        }
+        persistTestCases()
+        status = "테스트 케이스를 저장했습니다: \(name)"
+    }
+
+    func deleteSelectedTestCase() {
+        guard let id = selectedTestCaseID, !isTestRunning else { return }
+        savedTestCases.removeAll { $0.id == id }
+        persistTestCases()
+        newTestCase()
+        status = "테스트 케이스를 삭제했습니다."
+    }
+
+    func runTestCasePreview() {
+        guard !isPreviewingTestCase,
+              let row = rows.first,
+              let dataset = selectedDataset,
+              dataset.kind == .source else {
+            status = "미리 실행할 원본 데이터셋을 선택하세요."
+            return
+        }
+        guard missingVariables.isEmpty, !selectedModelID.isEmpty else {
+            status = missingVariables.isEmpty ? "실행 모델을 선택하세요." : "데이터셋에 없는 프롬프트 변수가 있습니다."
+            return
+        }
+        let runPrompt = promptText
+        let runProvider = provider
+        let apiKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelID = selectedModelID
+        Task {
+            isPreviewingTestCase = true
+            defer { isPreviewingTestCase = false }
+            do {
+                let rendered = try PromptTemplate.render(runPrompt, values: row.values)
+                let result = await executeGenerationJob(
+                    LLMGenerationJob(index: 0, rowID: row.id, llmInput: rendered),
+                    provider: runProvider,
+                    apiKey: apiKey,
+                    modelID: modelID
+                )
+                let output = LLMOutputRecord(
+                    rowID: row.id,
+                    renderedInput: rendered,
+                    output: result.output,
+                    error: result.error,
+                    provider: runProvider.rawValue,
+                    modelID: modelID,
+                    latencyMilliseconds: result.latencyMilliseconds,
+                    inputTokens: result.inputTokens,
+                    outputTokens: result.outputTokens
+                )
+                try LLMOutputStore.save(output)
+                sampleOutput = output
+                if let text = output.output {
+                    testCaseCriteria = TestResultEvaluator.recommendCriteria(
+                        headers: headers,
+                        variableFields: promptVariables,
+                        sampleValues: row.values,
+                        output: text
+                    )
+                    status = "1행 출력을 별도 저장하고 평가 기준 추천값을 만들었습니다."
+                } else {
+                    status = "미리 실행 실패: \(output.error ?? "알 수 없는 오류")"
+                }
+            } catch {
+                status = "미리 실행 실패: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func runCriteriaPreview() {
+        guard !isRunningCriteriaPreview,
+              let dataset = selectedDataset,
+              dataset.kind == .source else {
+            status = "조건 미리보기에 사용할 원본 데이터셋을 선택하세요."
+            return
+        }
+        guard !testCaseCriteria.isEmpty else {
+            status = "먼저 조건을 하나 이상 설정하세요."
+            return
+        }
+        guard missingVariables.isEmpty, !selectedModelID.isEmpty else {
+            status = missingVariables.isEmpty ? "실행 모델을 선택하세요." : "데이터셋에 없는 프롬프트 변수가 있습니다."
+            return
+        }
+        let apiKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else {
+            status = "\(provider.rawValue) API 키를 입력하세요."
+            return
+        }
+
+        let previewRows = Array(rows.prefix(5))
+        guard !previewRows.isEmpty else {
+            status = "미리볼 데이터 행이 없습니다."
+            return
+        }
+        let runPrompt = promptText
+        let runProvider = provider
+        let modelID = selectedModelID
+        let concurrency = min(max(generationConcurrency, 1), previewRows.count)
+
+        Task {
+            isRunningCriteriaPreview = true
+            criteriaPreviewProgress = 0
+            defer { isRunningCriteriaPreview = false }
+
+            var recordsByIndex: [Int: LLMOutputRecord] = [:]
+            var jobs: [LLMGenerationJob] = []
+            for (index, row) in previewRows.enumerated() {
+                do {
+                    let rendered = try PromptTemplate.render(runPrompt, values: row.values)
+                    jobs.append(LLMGenerationJob(index: index, rowID: row.id, llmInput: rendered))
+                } catch {
+                    recordsByIndex[index] = LLMOutputRecord(
+                        rowID: row.id,
+                        renderedInput: "",
+                        output: nil,
+                        error: error.localizedDescription,
+                        provider: runProvider.rawValue,
+                        modelID: modelID,
+                        latencyMilliseconds: 0,
+                        inputTokens: nil,
+                        outputTokens: nil
+                    )
+                    criteriaPreviewProgress += 1
+                }
+            }
+
+            await withTaskGroup(of: LLMGenerationResult.self) { group in
+                var nextJobIndex = 0
+                for _ in 0..<min(concurrency, jobs.count) {
+                    let job = jobs[nextJobIndex]
+                    nextJobIndex += 1
+                    group.addTask {
+                        await executeGenerationJob(job, provider: runProvider, apiKey: apiKey, modelID: modelID)
+                    }
+                }
+
+                while let result = await group.next() {
+                    recordsByIndex[result.index] = LLMOutputRecord(
+                        rowID: result.rowID,
+                        renderedInput: result.llmInput,
+                        output: result.output,
+                        error: result.error,
+                        provider: runProvider.rawValue,
+                        modelID: modelID,
+                        latencyMilliseconds: result.latencyMilliseconds,
+                        inputTokens: result.inputTokens,
+                        outputTokens: result.outputTokens
+                    )
+                    criteriaPreviewProgress += 1
+                    if nextJobIndex < jobs.count {
+                        let job = jobs[nextJobIndex]
+                        nextJobIndex += 1
+                        group.addTask {
+                            await executeGenerationJob(job, provider: runProvider, apiKey: apiKey, modelID: modelID)
+                        }
+                    }
+                }
+            }
+
+            do {
+                let ordered = recordsByIndex.keys.sorted().compactMap { recordsByIndex[$0] }
+                for record in ordered {
+                    try LLMOutputStore.save(record)
+                }
+                criteriaPreviewOutputs = ordered
+                let failures = ordered.filter { $0.error != nil }.count
+                status = failures == 0
+                    ? "5행 조건 미리보기를 완료했습니다. 조건을 수정하면 결과가 즉시 갱신됩니다."
+                    : "5행 중 \(failures)행의 미리 실행이 실패했습니다."
+            } catch {
+                status = "조건 미리보기 저장 실패: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func criterionResults(for preview: TestCaseCriteriaPreview) -> [CriterionRunResult] {
+        guard let output = preview.output.output else { return [] }
+        return TestResultEvaluator.evaluate(
+            criteria: testCaseCriteria,
+            values: preview.row.values,
+            output: output
+        )
+    }
+
+    func recommendCriteriaWithCodex() {
+        guard !isRecommendingCriteria,
+              let row = rows.first,
+              let output = sampleOutput?.output else {
+            status = "먼저 1행 테스트를 실행해 output을 생성하세요."
+            return
+        }
+        let model = codexEvaluationModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            status = "추천에 사용할 로컬 agent 모델을 선택하세요."
+            return
+        }
+        let variableFields = promptVariables
+        Task {
+            isRecommendingCriteria = true
+            defer { isRecommendingCriteria = false }
+            do {
+                let recommended = try await CodexCriterionRecommendationService.recommend(
+                    model: model,
+                    variableFields: variableFields,
+                    rowValues: row.values,
+                    output: output
+                )
+                guard !recommended.isEmpty else {
+                    status = "Codex가 추천 가능한 평가 기준을 찾지 못했습니다."
+                    return
+                }
+                testCaseCriteria = recommended
+                status = "\(model)로 평가 기준 \(recommended.count)개를 추천했습니다."
+            } catch {
+                status = "AI 추천은 실패했지만 기존 추천값은 유지됩니다: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func addTestCriterion() {
+        testCaseCriteria.append(TestCriterionDefinition(
+            name: "새 기준",
+            expectedField: testCaseExpectedFields.first ?? "",
+            expectedMinField: "",
+            expectedMaxField: "",
+            outputPath: sampleOutputPaths.first ?? "",
+            valueType: .text,
+            passRule: .exact
+        ))
+    }
+
+    func removeTestCriterion(id: UUID) {
+        testCaseCriteria.removeAll { $0.id == id }
+    }
+
+    func addArrayAssertion(to criterionID: UUID, kind: ArrayObjectAssertionKind) {
+        guard let index = testCaseCriteria.firstIndex(where: { $0.id == criterionID }) else { return }
+        switch kind {
+        case .datasetValue:
+            testCaseCriteria[index].arrayAssertions.append(.datasetValue(
+                field: testCaseExpectedFields.first ?? ""
+            ))
+        case .objectValueRange:
+            let objectField = arrayObjectFields(at: testCaseCriteria[index].outputPath).first ?? ""
+            let minimumField = testCaseExpectedFields.first(where: { $0.hasSuffix("_min") }) ?? ""
+            let maximumField = testCaseExpectedFields.first(where: { $0.hasSuffix("_max") }) ?? ""
+            testCaseCriteria[index].arrayAssertions.append(.objectValueRange(
+                objectField: objectField,
+                minimumField: minimumField,
+                maximumField: maximumField
+            ))
+        }
+    }
+
+    func removeArrayAssertion(from criterionID: UUID, assertionID: UUID) {
+        guard let index = testCaseCriteria.firstIndex(where: { $0.id == criterionID }) else { return }
+        testCaseCriteria[index].arrayAssertions.removeAll { $0.id == assertionID }
+    }
+
+    func startTestRun() {
+        guard !isTestRunning, let testCase = selectedTestCase else {
+            status = "실행할 테스트 케이스를 선택하세요."
+            return
+        }
+        guard let dataset = savedDatasets.first(where: { $0.id == testCase.datasetID && $0.kind == .source }) else {
+            status = "테스트 케이스의 원본 데이터셋을 찾을 수 없습니다."
+            return
+        }
+        guard !dataset.rows.isEmpty else {
+            status = "테스트 케이스의 데이터셋이 비어 있습니다."
+            return
+        }
+        guard !providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "\(testCase.provider) API 키를 입력하세요."
+            return
+        }
+        let count = min(max(testRunLimit, 1), dataset.rows.count)
+        activeTestRunTask = Task { await executeTestRun(testCase: testCase, dataset: dataset, count: count) }
+    }
+
+    func cancelTestRun() {
+        guard isTestRunning else { return }
+        activeTestRunTask?.cancel()
+        status = "테스트 취소를 요청했습니다. 완료된 행까지 결과 파일로 저장합니다."
+    }
+
+    func refreshTestRuns() {
+        do {
+            let previous = selectedTestRunID
+            testRuns = try TestRunStore.loadAll()
+            selectedTestRunID = previous.flatMap { id in testRuns.contains(where: { $0.id == id }) ? id : nil }
+                ?? testRuns.first?.id
+            status = "테스트 결과 \(testRuns.count)개를 불러왔습니다."
+        } catch {
+            status = "테스트 결과를 불러오지 못했습니다: \(error.localizedDescription)"
+        }
+    }
+
+    func selectTestRun(_ id: UUID?) {
+        selectedTestRunID = id
+        evaluationBundleURL = nil
+        evaluationSummary = nil
+        if let run = selectedTestRun {
+            codexJudgeLimit = run.rows.count
+            status = "테스트 결과를 선택했습니다: \(run.name)"
+        }
+    }
+
+    func openSelectedTestRun() {
+        guard let run = selectedTestRun, let folder = try? TestRunStore.folderURL(for: run.id) else {
+            status = "확인할 테스트 결과를 선택하세요."
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([folder])
+    }
+
+    func deleteSelectedTestRun() {
+        guard !isTestRunning else {
+            status = "테스트 실행 중에는 결과를 삭제할 수 없습니다."
+            return
+        }
+        guard let run = selectedTestRun else {
+            status = "삭제할 테스트 결과를 선택하세요."
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "테스트 결과를 삭제할까요?"
+        alert.informativeText = "LLM output과 테스트 결과 파일 전체가 삭제됩니다. 이미 생성된 평가 결과는 유지됩니다. 이 작업은 되돌릴 수 없습니다."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "삭제")
+        alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            try TestRunStore.delete(run)
+            if evaluationBundleURL != nil {
+                evaluationBundleURL = nil
+                evaluationSummary = nil
+            }
+            selectedTestRunID = nil
+            refreshTestRuns()
+            status = "테스트 결과를 삭제했습니다: \(run.name)"
+        } catch {
+            status = "테스트 결과를 삭제하지 못했습니다: \(error.localizedDescription)"
         }
     }
 
@@ -591,29 +1112,94 @@ final class AppState: ObservableObject {
                 status = "출력 생성이 끝난 뒤 평가 번들을 만들 수 있습니다."
                 return
             }
-            guard let dataset = selectedDataset, dataset.kind == .evaluation else {
-                status = "출력 생성으로 만든 LLM 실행 데이터셋을 선택하세요."
+            guard let run = selectedTestRun, run.status == .completed else {
+                status = "완료된 테스트 결과 파일을 선택하세요."
                 return
             }
-            guard completedCount > 0 else {
-                status = "평가 번들을 만들기 전에 모델 출력을 생성하세요."
+            let prompt = evaluationPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !prompt.isEmpty else {
+                status = "평가 프롬프트를 입력하세요."
+                return
+            }
+            let evaluationRows = run.rows.filter { $0.llmOutput != nil }.map { row in
+                var values = row.variables.merging(row.expectedValues) { _, expected in expected }
+                for result in row.criterionResults {
+                    let prefix = "criterion.\(result.name)"
+                    values["\(prefix).expected"] = result.expected
+                    values["\(prefix).actual"] = result.actual
+                    values["\(prefix).rule"] = result.passRule
+                    values["\(prefix).pass"] = String(result.passed)
+                }
+                return DatasetRow(
+                    id: row.rowID,
+                    values: values,
+                    llmInput: try? PromptTemplate.render(run.prompt, values: values),
+                    output: row.llmOutput,
+                    error: row.error,
+                    outputModel: row.modelID,
+                    latencyMilliseconds: row.latencyMilliseconds,
+                    inputTokens: row.inputTokens,
+                    outputTokens: row.outputTokens
+                )
+            }
+            guard !evaluationRows.isEmpty else {
+                status = "선택한 테스트 결과에 평가 가능한 LLM output이 없습니다."
                 return
             }
             evaluationBundleURL = try EvaluationBundle.write(input: EvaluationInput(
-                prompt: dataset.evaluationPrompt ?? promptText,
-                provider: dataset.evaluationProvider ?? provider.rawValue,
-                model: rows.compactMap(\.outputModel).first ?? dataset.evaluationModel ?? selectedModelName,
-                rows: rows,
-                datasetName: dataset.name,
-                sourceDatasetName: dataset.sourceDatasetName,
-                promptName: dataset.evaluationPromptName
+                prompt: run.prompt,
+                evaluationPrompt: prompt,
+                provider: run.provider,
+                model: run.modelID,
+                rows: evaluationRows,
+                datasetName: run.name,
+                sourceDatasetName: run.datasetName,
+                promptName: run.promptName,
+                testCaseName: run.testCaseName,
+                criteria: run.criteria
             ))
             evaluationSummary = nil
+            evaluationProgress = 0
+            evaluationTotal = minEvaluationCount(totalRows: evaluationRows.count)
             selectedEvaluationResultID = evaluationBundleURL?.lastPathComponent
             refreshEvaluationResults(silent: true)
             status = "Promptfoo + Codex 평가 번들을 만들었습니다."
         } catch {
             status = error.localizedDescription
+        }
+    }
+
+    func resetEvaluationPrompt() {
+        evaluationPrompt = Self.defaultEvaluationPrompt
+        status = "기본 평가 프롬프트로 되돌렸습니다."
+    }
+
+    func recommendEvaluationPrompt() {
+        guard !isRecommendingEvaluationPrompt,
+              let run = selectedTestRun,
+              run.status == .completed else {
+            status = "완료된 테스트 결과를 선택한 뒤 평가 프롬프트를 추천받으세요."
+            return
+        }
+        let model = codexEvaluationModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            status = "추천에 사용할 평가 모델을 선택하세요."
+            return
+        }
+
+        Task {
+            isRecommendingEvaluationPrompt = true
+            defer { isRecommendingEvaluationPrompt = false }
+            do {
+                evaluationPrompt = try await EvaluationPromptRecommendationService.recommend(
+                    model: model,
+                    originalPrompt: run.prompt,
+                    criteria: run.criteria
+                )
+                status = "\(model)로 평가 프롬프트를 추천했습니다."
+            } catch {
+                status = "평가 프롬프트 추천 실패: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -636,6 +1222,10 @@ final class AppState: ObservableObject {
         Task {
             do {
                 isEvaluating = true
+                evaluationProgress = 0
+                let inputURL = evaluationBundleURL.appendingPathComponent("eval-input.json")
+                let input = try JSONDecoder().decode(EvaluationInput.self, from: Data(contentsOf: inputURL))
+                evaluationTotal = minEvaluationCount(totalRows: input.rows.count)
                 let bundleNodeModules = evaluationBundleURL.appendingPathComponent("node_modules", isDirectory: true)
                 if !FileManager.default.fileExists(atPath: bundleNodeModules.path) {
                     let runtime = try EvaluationBundle.prepareSharedRuntime()
@@ -652,8 +1242,14 @@ final class AppState: ObservableObject {
                 }
 
                 let judgeLimit = max(codexJudgeLimit, 0)
-                let judgeConcurrency = min(max(codexConcurrency, 2), 4)
-                status = "Promptfoo와 Codex 평가를 실행하는 중: Codex 동시 실행 \(judgeConcurrency)개"
+                let judgeConcurrency = min(max(codexConcurrency, 2), 8)
+                status = "Promptfoo 검증 후 Codex 평가를 시작합니다."
+                let progressTask = Task {
+                    await monitorEvaluationProgress(
+                        at: evaluationBundleURL.appendingPathComponent("results/codex-judgements.json")
+                    )
+                }
+                defer { progressTask.cancel() }
                 try await ProcessRunner.run(
                     command: "pnpm",
                     arguments: ["run", "eval"],
@@ -664,6 +1260,7 @@ final class AppState: ObservableObject {
                         "CODEX_MODEL": evaluationModel,
                     ]
                 )
+                evaluationProgress = evaluationTotal
                 try EvaluationBundle.lockCompletedResults(in: evaluationBundleURL)
                 let summaryURL = evaluationBundleURL.appendingPathComponent("results/summary.json")
                 let decoder = JSONDecoder()
@@ -681,6 +1278,24 @@ final class AppState: ObservableObject {
                 status = error.localizedDescription
             }
             isEvaluating = false
+        }
+    }
+
+    private func minEvaluationCount(totalRows: Int) -> Int {
+        let limit = max(codexJudgeLimit, 0)
+        return limit == 0 ? totalRows : min(limit, totalRows)
+    }
+
+    private func monitorEvaluationProgress(at judgementsURL: URL) async {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        while !Task.isCancelled {
+            if let data = try? Data(contentsOf: judgementsURL),
+               let judgements = try? decoder.decode([CodexJudgementRecord].self, from: data) {
+                evaluationProgress = min(judgements.count, evaluationTotal)
+                status = "Codex 평가 진행 중: \(evaluationProgress)/\(evaluationTotal)"
+            }
+            try? await Task.sleep(nanoseconds: 400_000_000)
         }
     }
 
@@ -709,6 +1324,68 @@ final class AppState: ObservableObject {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([result.folderURL])
+    }
+
+    func shareSelectedEvaluationResultToPromptfoo() {
+        let apiKey = promptfooAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else {
+            status = "Promptfoo API 키를 입력한 뒤 평가 결과를 전송하세요."
+            return
+        }
+        guard let result = selectedEvaluationResult else {
+            status = "Promptfoo로 전송할 평가 결과를 선택하세요."
+            return
+        }
+        guard result.isComplete else {
+            status = "완료된 평가 결과만 Promptfoo로 전송할 수 있습니다."
+            return
+        }
+        guard result.integrity != .invalid else {
+            status = "무결성 검증에 실패한 평가 로그는 Promptfoo로 전송할 수 없습니다."
+            return
+        }
+
+        Task {
+            do {
+                isSharingEvaluation = true
+                let bundleNodeModules = result.folderURL.appendingPathComponent("node_modules", isDirectory: true)
+                if !FileManager.default.fileExists(atPath: bundleNodeModules.path) {
+                    let runtime = try EvaluationBundle.prepareSharedRuntime()
+                    if runtime.needsInstall {
+                        status = "Promptfoo 공유 의존성을 처음 한 번 설치하는 중..."
+                        try await ProcessRunner.run(
+                            command: "pnpm",
+                            arguments: ["install", "--ignore-scripts"],
+                            workingDirectory: runtime.directory
+                        )
+                        try EvaluationBundle.markSharedRuntimeReady(at: runtime.directory)
+                    }
+                    try EvaluationBundle.linkSharedRuntime(from: runtime.directory, to: result.folderURL)
+                }
+
+                status = "저장된 Codex 평가 결과를 Promptfoo 형식으로 준비하는 중..."
+                let shareRuntime = try EvaluationBundle.preparePromptfooShareRuntime(for: result.folderURL)
+                defer { try? FileManager.default.removeItem(at: shareRuntime.directory) }
+                try await ProcessRunner.run(
+                    command: "node",
+                    arguments: [shareRuntime.scriptURL.lastPathComponent],
+                    workingDirectory: shareRuntime.directory,
+                    environment: ["PROMPTEVAL_BUNDLE": result.folderURL.path]
+                )
+
+                status = "최종 정성 평가 결과를 Promptfoo Cloud로 전송하는 중..."
+                try await ProcessRunner.run(
+                    command: "pnpm",
+                    arguments: ["exec", "promptfoo", "share"],
+                    workingDirectory: shareRuntime.directory,
+                    environment: ["PROMPTFOO_API_KEY": apiKey]
+                )
+                status = "최종 Codex 정성 평가 결과를 Promptfoo로 전송했습니다. Promptfoo Cloud에서 공유된 평가를 확인하세요."
+            } catch {
+                status = "Promptfoo 전송 실패: \(error.localizedDescription)"
+            }
+            isSharingEvaluation = false
+        }
     }
 
     func deleteSelectedEvaluationResult() {
@@ -762,19 +1439,144 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func executeTestRun(testCase: SavedTestCase, dataset: SavedDataset, count: Int) async {
+        isTestRunning = true
+        progress = 0
+        let startedAt = Date()
+        let runID = UUID()
+        let sourceRows = Array(dataset.rows.prefix(count))
+        let runProvider = ProviderKind(rawValue: testCase.provider) ?? .gemini
+        let apiKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var jobs: [LLMGenerationJob] = []
+        var outputRecords: [LLMOutputRecord] = []
+        var resultRows: [TestRunRowResult] = []
+
+        for (index, row) in sourceRows.enumerated() {
+            do {
+                let rendered = try PromptTemplate.render(testCase.prompt, values: row.values)
+                jobs.append(LLMGenerationJob(index: index, rowID: row.id, llmInput: rendered))
+            } catch {
+                resultRows.append(TestRunRowResult(
+                    id: UUID(),
+                    rowID: row.id,
+                    variables: dictionary(row.values, keys: PromptTemplate.variables(in: testCase.prompt)),
+                    expectedValues: dictionaryExcluding(row.values, keys: PromptTemplate.variables(in: testCase.prompt)),
+                    criterionResults: [],
+                    latencyMilliseconds: 0,
+                    inputTokens: nil,
+                    outputTokens: nil,
+                    modelID: testCase.modelID,
+                    llmOutput: nil,
+                    error: error.localizedDescription
+                ))
+                progress += 1
+            }
+        }
+
+        let concurrency = min(max(generationConcurrency, 1), max(jobs.count, 1))
+        await withTaskGroup(of: LLMGenerationResult.self) { group in
+            var nextJobIndex = 0
+            for _ in 0..<min(concurrency, jobs.count) {
+                let job = jobs[nextJobIndex]
+                nextJobIndex += 1
+                group.addTask {
+                    await executeGenerationJob(job, provider: runProvider, apiKey: apiKey, modelID: testCase.modelID)
+                }
+            }
+
+            while let result = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                guard let row = sourceRows.first(where: { $0.id == result.rowID }) else { continue }
+                let outputRecord = LLMOutputRecord(
+                    rowID: row.id,
+                    renderedInput: result.llmInput,
+                    output: result.output,
+                    error: result.error,
+                    provider: testCase.provider,
+                    modelID: testCase.modelID,
+                    latencyMilliseconds: result.latencyMilliseconds,
+                    inputTokens: result.inputTokens,
+                    outputTokens: result.outputTokens
+                )
+                outputRecords.append(outputRecord)
+                let criteriaResults = result.output.map {
+                    TestResultEvaluator.evaluate(criteria: testCase.criteria, values: row.values, output: $0)
+                } ?? []
+                let variableFields = PromptTemplate.variables(in: testCase.prompt)
+                resultRows.append(TestRunRowResult(
+                    id: outputRecord.id,
+                    rowID: row.id,
+                    variables: dictionary(row.values, keys: variableFields),
+                    expectedValues: dictionaryExcluding(row.values, keys: variableFields),
+                    criterionResults: criteriaResults,
+                    latencyMilliseconds: result.latencyMilliseconds,
+                    inputTokens: result.inputTokens,
+                    outputTokens: result.outputTokens,
+                    modelID: testCase.modelID,
+                    llmOutput: result.output,
+                    error: result.error
+                ))
+                progress += 1
+                status = "테스트 실행 중: \(progress) / \(count) · 동시 실행 \(concurrency)개"
+
+                if nextJobIndex < jobs.count, !Task.isCancelled {
+                    let job = jobs[nextJobIndex]
+                    nextJobIndex += 1
+                    group.addTask {
+                        await executeGenerationJob(job, provider: runProvider, apiKey: apiKey, modelID: testCase.modelID)
+                    }
+                }
+            }
+        }
+
+        let wasCancelled = Task.isCancelled
+        let run = SavedTestRun(
+            id: runID,
+            name: testRunName(testCase.name, date: startedAt),
+            testCaseID: testCase.id,
+            testCaseName: testCase.name,
+            datasetID: dataset.id,
+            datasetName: dataset.name,
+            promptID: testCase.promptID,
+            promptName: testCase.promptName,
+            prompt: testCase.prompt,
+            provider: testCase.provider,
+            modelID: testCase.modelID,
+            criteria: testCase.criteria,
+            requestedCount: count,
+            status: wasCancelled ? .cancelled : .completed,
+            startedAt: startedAt,
+            completedAt: Date(),
+            rows: resultRows.sorted { left, right in
+                let leftIndex = sourceRows.firstIndex { $0.id == left.rowID } ?? .max
+                let rightIndex = sourceRows.firstIndex { $0.id == right.rowID } ?? .max
+                return leftIndex < rightIndex
+            }
+        )
+        do {
+            try TestRunStore.save(run, outputs: outputRecords)
+            testRuns = try TestRunStore.loadAll()
+            selectedTestRunID = run.id
+            status = wasCancelled
+                ? "테스트를 취소하고 완료된 \(resultRows.count)개 행을 별도 결과로 저장했습니다."
+                : "테스트 \(count)개 행을 완료하고 데이터셋과 분리된 결과 파일로 저장했습니다."
+        } catch {
+            status = "테스트 결과 저장 실패: \(error.localizedDescription)"
+        }
+        isTestRunning = false
+        activeTestRunTask = nil
+    }
+
     private func applyDataset(name: String, headers: [String], rows: [DatasetRow], fileExtension: String) {
         self.datasetName = name
         self.headers = headers
         self.rows = rows
-        if let index = savedDatasets.firstIndex(where: { $0.name == name }) {
-            savedDatasets[index].fileExtension = fileExtension
-            savedDatasets[index].updateContents(headers: headers, rows: rows)
-            selectedDatasetID = savedDatasets[index].id
-        } else {
-            let dataset = SavedDataset(name: name, headers: headers, rows: rows, fileExtension: fileExtension)
-            savedDatasets.insert(dataset, at: 0)
-            selectedDatasetID = dataset.id
-        }
+        let dataset = SavedDataset(name: name, headers: headers, rows: rows, fileExtension: fileExtension)
+        savedDatasets.insert(dataset, at: 0)
+        selectedDatasetID = dataset.id
         persistLibrary()
         self.status = "\(name)에서 \(rows.count)개 행을 불러왔습니다."
     }
@@ -820,5 +1622,29 @@ final class AppState: ObservableObject {
         } catch {
             status = "라이브러리를 저장하지 못했습니다: \(error.localizedDescription)"
         }
+    }
+
+    private func persistTestCases() {
+        do {
+            savedTestCases.sort { $0.updatedAt > $1.updatedAt }
+            try TestCaseStore.save(savedTestCases)
+        } catch {
+            status = "테스트 케이스를 저장하지 못했습니다: \(error.localizedDescription)"
+        }
+    }
+
+    private func dictionary(_ values: [String: String], keys: [String]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: keys.compactMap { key in values[key].map { (key, $0) } })
+    }
+
+    private func dictionaryExcluding(_ values: [String: String], keys: [String]) -> [String: String] {
+        values.filter { !keys.contains($0.key) }
+    }
+
+    private func testRunName(_ testCaseName: String, date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.dateFormat = "yyyy-MM-dd HHmmss"
+        return "\(testCaseName) - \(formatter.string(from: date))"
     }
 }
