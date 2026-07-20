@@ -171,6 +171,395 @@ struct SavedLibrary: Codable {
     static let empty = SavedLibrary(prompts: [], datasets: [])
 }
 
+struct PromptOutputSchema {
+    let json: String
+    let exampleJSON: String
+    let paths: [String]
+
+    static func extract(from prompt: String) -> Self? {
+        for candidate in jsonCandidates(in: prompt) {
+            guard let value = parse(candidate) else { continue }
+            let outputValue = exampleValue(from: value)
+            var paths: [String] = []
+            collectPaths(outputValue, prefix: "", into: &paths)
+            guard !paths.isEmpty,
+                  let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]),
+                  let json = String(data: data, encoding: .utf8),
+                  let exampleData = try? JSONSerialization.data(
+                    withJSONObject: outputValue,
+                    options: [.prettyPrinted, .sortedKeys]
+                  ),
+                  let exampleJSON = String(data: exampleData, encoding: .utf8) else {
+                continue
+            }
+            return Self(json: json, exampleJSON: exampleJSON, paths: Array(Set(paths)).sorted())
+        }
+        return nil
+    }
+
+    func objectFields(atArrayPath path: String) -> [String] {
+        let prefix = "\(path)[]."
+        return Array(Set(paths.compactMap { candidate in
+            guard candidate.hasPrefix(prefix) else { return nil }
+            return candidate.dropFirst(prefix.count).split(separator: ".").first.map(String.init)
+        }))
+        .sorted()
+    }
+
+    var exampleNodes: [PromptOutputExampleNode] {
+        guard let value = Self.parse(exampleJSON) else { return [] }
+        var result: [PromptOutputExampleNode] = []
+        Self.collectExampleNodes(value, path: "", nodeIDPath: "", depth: 0, into: &result)
+        return result
+    }
+
+    private static func jsonCandidates(in prompt: String) -> [String] {
+        let fenced = fencedJSONBlocks(in: prompt)
+        return fenced + balancedJSONCandidates(in: prompt)
+    }
+
+    private static func fencedJSONBlocks(in prompt: String) -> [String] {
+        let pattern = #"```(?:json|JSON)?[ \t]*\n([\s\S]*?)```"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(prompt.startIndex..., in: prompt)
+        return expression.matches(in: prompt, range: range).compactMap { match in
+            guard let range = Range(match.range(at: 1), in: prompt) else { return nil }
+            return String(prompt[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    private static func balancedJSONCandidates(in prompt: String) -> [String] {
+        let characters = Array(prompt)
+        var candidates: [String] = []
+        for index in characters.indices where characters[index] == "{" || characters[index] == "[" {
+            guard let end = balancedEnd(in: characters, startingAt: index) else { continue }
+            candidates.append(String(characters[index...end]))
+        }
+        return candidates
+    }
+
+    private static func balancedEnd(in characters: [Character], startingAt start: Int) -> Int? {
+        var stack: [Character] = []
+        var isInString = false
+        var isEscaped = false
+        for index in start..<characters.count {
+            let character = characters[index]
+            if isInString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInString = false
+                }
+                continue
+            }
+            if character == "\"" {
+                isInString = true
+            } else if character == "{" || character == "[" {
+                stack.append(character)
+            } else if character == "}" || character == "]" {
+                guard let opening = stack.popLast(),
+                      (opening == "{" && character == "}") || (opening == "[" && character == "]") else {
+                    return nil
+                }
+                if stack.isEmpty { return index }
+            }
+        }
+        return nil
+    }
+
+    private static func parse(_ text: String) -> Any? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        if let value = try? JSONSerialization.jsonObject(with: data) {
+            return value
+        }
+
+        // Spreadsheet-style JSON sometimes doubles every quote. Only repair it
+        // after standard JSON parsing has failed, so valid empty strings remain intact.
+        let repaired = text.replacingOccurrences(of: "\"\"", with: "\"")
+        guard repaired != text, let repairedData = repaired.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: repairedData)
+    }
+
+    private static func exampleValue(
+        from value: Any,
+        key: String? = nil,
+        path: String = "",
+        arrayIndex: Int = 0
+    ) -> Any {
+        if let schema = value as? [String: Any], isJSONSchema(schema) {
+            return exampleValue(fromSchema: schema, rootSchema: schema, key: key, path: path, arrayIndex: arrayIndex)
+        }
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                let childPath = path.isEmpty ? entry.key : "\(path).\(entry.key)"
+                result[entry.key] = exampleValue(
+                    from: entry.value,
+                    key: entry.key,
+                    path: childPath,
+                    arrayIndex: arrayIndex
+                )
+            }
+        }
+        if let array = value as? [Any] {
+            guard let first = array.first else { return [] }
+            return [0, 1].map { index in
+                exampleValue(from: first, key: key, path: "\(path)[\(index)]", arrayIndex: index)
+            }
+        }
+        if value is Bool { return arrayIndex.isMultiple(of: 2) }
+        if value is NSNumber {
+            let normalizedKey = key?.lowercased() ?? ""
+            return mockNumber(for: normalizedKey, arrayIndex: arrayIndex)
+        }
+        if value is String { return mockString(for: key, path: path, arrayIndex: arrayIndex) }
+        return NSNull()
+    }
+
+    private static func isJSONSchema(_ value: [String: Any]) -> Bool {
+        value["properties"] != nil
+            || value["$defs"] != nil
+            || value["$ref"] != nil
+            || value["items"] != nil
+            || value["enum"] != nil
+            || value["const"] != nil
+            || ["object", "array", "string", "integer", "number", "boolean"].contains(value["type"] as? String ?? "")
+    }
+
+    private static func exampleValue(
+        fromSchema schema: [String: Any],
+        rootSchema: [String: Any],
+        key: String?,
+        path: String,
+        arrayIndex: Int
+    ) -> Any {
+        if let reference = schema["$ref"] as? String,
+           let referencedSchema = resolve(reference: reference, in: rootSchema) {
+            return exampleValue(
+                fromSchema: referencedSchema,
+                rootSchema: rootSchema,
+                key: key,
+                path: path,
+                arrayIndex: arrayIndex
+            )
+        }
+        if let constant = schema["const"] { return constant }
+        if let values = schema["enum"] as? [Any], let first = values.first { return first }
+        if let examples = schema["examples"] as? [Any], let first = examples.first { return first }
+
+        if let properties = schema["properties"] as? [String: Any] {
+            return properties.keys.sorted().reduce(into: [String: Any]()) { result, property in
+                let childPath = path.isEmpty ? property : "\(path).\(property)"
+                let childSchema = properties[property] as? [String: Any] ?? [:]
+                result[property] = exampleValue(
+                    fromSchema: childSchema,
+                    rootSchema: rootSchema,
+                    key: property,
+                    path: childPath,
+                    arrayIndex: arrayIndex
+                )
+            }
+        }
+
+        let type = (schema["type"] as? [String])?.first ?? schema["type"] as? String
+        switch type {
+        case "array":
+            let items = schema["items"] as? [String: Any] ?? [:]
+            return [0, 1].map { index in
+                exampleValue(
+                    fromSchema: items,
+                    rootSchema: rootSchema,
+                    key: key,
+                    path: "\(path)[\(index)]",
+                    arrayIndex: index
+                )
+            }
+        case "boolean":
+            return arrayIndex.isMultiple(of: 2)
+        case "integer", "number":
+            return mockNumber(for: key?.lowercased() ?? "", arrayIndex: arrayIndex)
+        case "string":
+            return mockString(for: key, path: path, arrayIndex: arrayIndex)
+        default:
+            return mockString(for: key, path: path, arrayIndex: arrayIndex)
+        }
+    }
+
+    private static func resolve(reference: String, in rootSchema: [String: Any]) -> [String: Any]? {
+        guard reference.hasPrefix("#/") else { return nil }
+        var current: Any = rootSchema
+        for component in reference.dropFirst(2).split(separator: "/") {
+            let key = component
+                .replacingOccurrences(of: "~1", with: "/")
+                .replacingOccurrences(of: "~0", with: "~")
+            guard let dictionary = current as? [String: Any], let next = dictionary[key] else { return nil }
+            current = next
+        }
+        return current as? [String: Any]
+    }
+
+    private static func mockNumber(for normalizedKey: String, arrayIndex: Int) -> Int {
+        if normalizedKey.contains("spam") { return 0 }
+        if normalizedKey.contains("importance") { return 65 + arrayIndex }
+        if normalizedKey.contains("emotion") { return 70 + arrayIndex }
+        if normalizedKey.contains("sentiment") { return 68 + arrayIndex }
+        if normalizedKey.contains("risk") { return 70 - (arrayIndex * 20) }
+        if normalizedKey.contains("score") { return 72 + (arrayIndex * 11) }
+        return arrayIndex + 1
+    }
+
+    private static func mockString(for key: String?, path: String, arrayIndex: Int) -> String {
+        let normalizedKey = key?.lowercased() ?? ""
+        let normalizedPath = path.lowercased()
+        let suffix = arrayIndex + 1
+        if normalizedKey.contains("language") || normalizedKey.contains("lang") {
+            return arrayIndex == 0 ? "ko" : "en"
+        }
+        if normalizedPath.contains("risk_detection") && normalizedKey.contains("type") {
+            return arrayIndex == 0 ? "customer_trust" : "legal_response"
+        }
+        if normalizedPath.contains("analyze_emotion") && normalizedKey.contains("type") {
+            return arrayIndex == 0 ? "frustration" : "concern"
+        }
+        if normalizedPath.contains("inquiry_classification") && normalizedKey == "inquiry_type" {
+            return "incident"
+        }
+        if normalizedKey.hasPrefix("inquiry_key") {
+            return "예시 문의 핵심 내용 \(suffix)"
+        }
+        if normalizedKey.contains("summary") {
+            return "고객 문의 요약 예시"
+        }
+        if normalizedKey.contains("reason") || normalizedKey.contains("message") {
+            return "예시 분석 사유 \(suffix)"
+        }
+        if normalizedKey.contains("id") {
+            return "example-\(suffix)"
+        }
+        if normalizedKey.contains("name") {
+            return "예시 이름 \(suffix)"
+        }
+        if normalizedKey.contains("status") {
+            return arrayIndex == 0 ? "active" : "pending"
+        }
+        return "예시 \(key ?? "값") \(suffix)"
+    }
+
+    private static func collectPaths(_ value: Any, prefix: String, into result: inout [String]) {
+        if let dictionary = value as? [String: Any] {
+            if dictionary.isEmpty, !prefix.isEmpty { result.append(prefix) }
+            for key in dictionary.keys.sorted() {
+                let path = prefix.isEmpty ? key : "\(prefix).\(key)"
+                if let child = dictionary[key] {
+                    collectPaths(child, prefix: path, into: &result)
+                }
+            }
+        } else if let array = value as? [Any] {
+            if array.isEmpty, !prefix.isEmpty {
+                result.append(prefix)
+            } else {
+                collectPaths(array[0], prefix: "\(prefix)[]", into: &result)
+            }
+        } else if !prefix.isEmpty {
+            result.append(prefix)
+        }
+    }
+
+    private static func collectExampleNodes(
+        _ value: Any,
+        path: String,
+        nodeIDPath: String,
+        depth: Int,
+        into result: inout [PromptOutputExampleNode]
+    ) {
+        if let dictionary = value as? [String: Any] {
+            for key in dictionary.keys.sorted() {
+                let childPath = path.isEmpty ? key : "\(path).\(key)"
+                let childNodeIDPath = nodeIDPath.isEmpty ? key : "\(nodeIDPath).\(key)"
+                guard let child = dictionary[key] else { continue }
+                if isContainer(child) {
+                    result.append(PromptOutputExampleNode(
+                        id: childNodeIDPath,
+                        path: childPath,
+                        depth: depth,
+                        label: key,
+                        value: child is [Any] ? "[ ]" : "{ }",
+                        isSelectable: false
+                    ))
+                    collectExampleNodes(
+                        child,
+                        path: childPath,
+                        nodeIDPath: childNodeIDPath,
+                        depth: depth + 1,
+                        into: &result
+                    )
+                } else {
+                    result.append(PromptOutputExampleNode(
+                        id: childNodeIDPath,
+                        path: childPath,
+                        depth: depth,
+                        label: key,
+                        value: displayValue(child),
+                        isSelectable: true
+                    ))
+                }
+            }
+        } else if let array = value as? [Any] {
+            for (index, child) in array.enumerated() {
+                let childPath = "\(path)[]"
+                let childNodeIDPath = "\(nodeIDPath)[\(index)]"
+                if isContainer(child) {
+                    result.append(PromptOutputExampleNode(
+                        id: childNodeIDPath,
+                        path: childPath,
+                        depth: depth,
+                        label: "[\(index)]",
+                        value: child is [Any] ? "[ ]" : "{ }",
+                        isSelectable: false
+                    ))
+                    collectExampleNodes(
+                        child,
+                        path: childPath,
+                        nodeIDPath: childNodeIDPath,
+                        depth: depth + 1,
+                        into: &result
+                    )
+                } else {
+                    result.append(PromptOutputExampleNode(
+                        id: childNodeIDPath,
+                        path: childPath,
+                        depth: depth,
+                        label: "[\(index)]",
+                        value: displayValue(child),
+                        isSelectable: true
+                    ))
+                }
+            }
+        }
+    }
+
+    private static func isContainer(_ value: Any) -> Bool {
+        value is [String: Any] || value is [Any]
+    }
+
+    private static func displayValue(_ value: Any) -> String {
+        if let string = value as? String { return "\"\(string)\"" }
+        if let boolean = value as? Bool { return boolean ? "true" : "false" }
+        if let number = value as? NSNumber { return number.stringValue }
+        return "null"
+    }
+}
+
+struct PromptOutputExampleNode: Identifiable {
+    let id: String
+    let path: String
+    let depth: Int
+    let label: String
+    let value: String
+    let isSelectable: Bool
+}
+
 struct EvaluationInput: Codable {
     let prompt: String
     let evaluationPrompt: String?
@@ -182,6 +571,8 @@ struct EvaluationInput: Codable {
     let promptName: String?
     let testCaseName: String?
     let criteria: [TestCriterionDefinition]?
+    let displayDatasetFields: [String]?
+    let displayOutputPaths: [String]?
 
     init(
         prompt: String,
@@ -193,7 +584,9 @@ struct EvaluationInput: Codable {
         sourceDatasetName: String? = nil,
         promptName: String? = nil,
         testCaseName: String? = nil,
-        criteria: [TestCriterionDefinition]? = nil
+        criteria: [TestCriterionDefinition]? = nil,
+        displayDatasetFields: [String]? = nil,
+        displayOutputPaths: [String]? = nil
     ) {
         self.prompt = prompt
         self.evaluationPrompt = evaluationPrompt
@@ -205,6 +598,8 @@ struct EvaluationInput: Codable {
         self.promptName = promptName
         self.testCaseName = testCaseName
         self.criteria = criteria
+        self.displayDatasetFields = displayDatasetFields
+        self.displayOutputPaths = displayOutputPaths
     }
 }
 

@@ -5,6 +5,7 @@ enum CriterionValueType: String, Codable, CaseIterable, Identifiable {
     case number = "숫자"
     case boolean = "Boolean"
     case json = "JSON"
+    case arrayObject = "배열 객체"
 
     var id: String { rawValue }
 }
@@ -17,7 +18,7 @@ enum PassRuleType: String, Codable, CaseIterable, Identifiable {
     case arrayObjectCondition = "배열 객체 조건"
 
     static var allCases: [PassRuleType] {
-        [.exact, .range, .contains, .exists, .arrayObjectCondition]
+        [.exact, .range, .contains, .exists]
     }
 
     var id: String { rawValue }
@@ -46,21 +47,53 @@ enum PassRuleType: String, Codable, CaseIterable, Identifiable {
 enum ArrayObjectAssertionKind: String, Codable, CaseIterable, Identifiable {
     case datasetValue = "데이터셋 값"
     case objectValueRange = "요소 값 범위"
+    case objectValueAllowedValues = "요소 값 허용 목록"
+    case arrayValueRequired = "배열 필수 값"
+    case arrayValueForbidden = "배열 값 제외"
 
     var id: String { rawValue }
 }
 
 struct ArrayObjectAssertion: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
+    var name: String
     var kind: ArrayObjectAssertionKind
     var datasetField: String
     var expectedValue: String
     var objectField: String
     var minimumField: String
     var maximumField: String
+    var allowEmptyArray: Bool
 
-    static func datasetValue(field: String = "", expectedValue: String = "1") -> Self {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        kind: ArrayObjectAssertionKind,
+        datasetField: String,
+        expectedValue: String,
+        objectField: String,
+        minimumField: String,
+        maximumField: String,
+        allowEmptyArray: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.datasetField = datasetField
+        self.expectedValue = expectedValue
+        self.objectField = objectField
+        self.minimumField = minimumField
+        self.maximumField = maximumField
+        self.allowEmptyArray = allowEmptyArray
+    }
+
+    static func datasetValue(
+        name: String = "데이터셋 값 확인",
+        field: String = "",
+        expectedValue: String = "1"
+    ) -> Self {
         Self(
+            name: name,
             kind: .datasetValue,
             datasetField: field,
             expectedValue: expectedValue,
@@ -70,8 +103,14 @@ struct ArrayObjectAssertion: Identifiable, Codable, Hashable {
         )
     }
 
-    static func objectValueRange(objectField: String = "", minimumField: String = "", maximumField: String = "") -> Self {
+    static func objectValueRange(
+        name: String = "요소 값 범위 확인",
+        objectField: String = "",
+        minimumField: String = "",
+        maximumField: String = ""
+    ) -> Self {
         Self(
+            name: name,
             kind: .objectValueRange,
             datasetField: "",
             expectedValue: "",
@@ -79,6 +118,81 @@ struct ArrayObjectAssertion: Identifiable, Codable, Hashable {
             minimumField: minimumField,
             maximumField: maximumField
         )
+    }
+
+    static func objectValueAllowedValues(
+        name: String = "배열 값 허용 확인",
+        objectField: String = "",
+        allowedValues: String = ""
+    ) -> Self {
+        Self(
+            name: name,
+            kind: .objectValueAllowedValues,
+            datasetField: "",
+            expectedValue: allowedValues,
+            objectField: objectField,
+            minimumField: "",
+            maximumField: ""
+        )
+    }
+
+    static func arrayValueForbidden(
+        name: String = "배열 값 제외 확인",
+        objectField: String = "",
+        forbiddenValues: String = ""
+    ) -> Self {
+        Self(
+            name: name,
+            kind: .arrayValueForbidden,
+            datasetField: "",
+            expectedValue: forbiddenValues,
+            objectField: objectField,
+            minimumField: "",
+            maximumField: ""
+        )
+    }
+
+    static func arrayValueRequired(
+        name: String = "배열 필수 값 확인",
+        objectField: String = "",
+        requiredValues: String = ""
+    ) -> Self {
+        Self(
+            name: name,
+            kind: .arrayValueRequired,
+            datasetField: "",
+            expectedValue: requiredValues,
+            objectField: objectField,
+            minimumField: "",
+            maximumField: ""
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, kind, datasetField, expectedValue, objectField, minimumField, maximumField, allowEmptyArray
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        kind = try container.decode(ArrayObjectAssertionKind.self, forKey: .kind)
+        datasetField = try container.decodeIfPresent(String.self, forKey: .datasetField) ?? ""
+        expectedValue = try container.decodeIfPresent(String.self, forKey: .expectedValue) ?? ""
+        objectField = try container.decodeIfPresent(String.self, forKey: .objectField) ?? ""
+        minimumField = try container.decodeIfPresent(String.self, forKey: .minimumField) ?? ""
+        maximumField = try container.decodeIfPresent(String.self, forKey: .maximumField) ?? ""
+        allowEmptyArray = try container.decodeIfPresent(Bool.self, forKey: .allowEmptyArray) ?? false
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? Self.defaultName(for: kind)
+    }
+
+    private static func defaultName(for kind: ArrayObjectAssertionKind) -> String {
+        switch kind {
+        case .datasetValue: "데이터셋 값 확인"
+        case .objectValueRange: "요소 값 범위 확인"
+        case .objectValueAllowedValues: "배열 값 허용 확인"
+        case .arrayValueRequired: "배열 필수 값 확인"
+        case .arrayValueForbidden: "배열 값 제외 확인"
+        }
     }
 }
 
@@ -146,8 +260,10 @@ struct TestCriterionDefinition: Identifiable, Codable, Hashable {
         expectedMinField = try container.decode(String.self, forKey: .expectedMinField)
         expectedMaxField = try container.decode(String.self, forKey: .expectedMaxField)
         outputPath = try container.decode(String.self, forKey: .outputPath)
-        valueType = try container.decode(CriterionValueType.self, forKey: .valueType)
-        passRule = try container.decode(PassRuleType.self, forKey: .passRule)
+        let decodedValueType = try container.decode(CriterionValueType.self, forKey: .valueType)
+        let decodedPassRule = try container.decode(PassRuleType.self, forKey: .passRule)
+        valueType = decodedPassRule == .arrayObjectCondition ? .arrayObject : decodedValueType
+        passRule = decodedPassRule == .arrayObjectCondition ? .exact : decodedPassRule
         matchField = try container.decodeIfPresent(String.self, forKey: .matchField)
         matchValue = try container.decodeIfPresent(String.self, forKey: .matchValue)
         valueField = try container.decodeIfPresent(String.self, forKey: .valueField)
@@ -171,7 +287,7 @@ struct TestCriterionDefinition: Identifiable, Codable, Hashable {
     }
 
     func withDefaultArrayAssertions() -> Self {
-        guard passRule == .arrayObjectCondition, arrayAssertions.isEmpty else { return self }
+        guard valueType == .arrayObject, arrayAssertions.isEmpty else { return self }
         var copy = self
         if !expectedField.isEmpty {
             copy.arrayAssertions.append(.datasetValue(field: expectedField))
@@ -200,6 +316,8 @@ struct SavedTestCase: Identifiable, Codable, Hashable {
     var modelID: String
     var recommendationModel: String
     var criteria: [TestCriterionDefinition]
+    var displayDatasetFields: [String]?
+    var displayOutputPaths: [String]?
     var sampleRowID: UUID?
     var sampleOutputID: UUID?
     var samplePreviewOutputIDs: [UUID]?
@@ -218,6 +336,8 @@ struct SavedTestCase: Identifiable, Codable, Hashable {
         modelID: String,
         recommendationModel: String,
         criteria: [TestCriterionDefinition] = [],
+        displayDatasetFields: [String]? = nil,
+        displayOutputPaths: [String]? = nil,
         sampleRowID: UUID? = nil,
         sampleOutputID: UUID? = nil,
         samplePreviewOutputIDs: [UUID]? = nil,
@@ -235,6 +355,8 @@ struct SavedTestCase: Identifiable, Codable, Hashable {
         self.modelID = modelID
         self.recommendationModel = recommendationModel
         self.criteria = criteria
+        self.displayDatasetFields = displayDatasetFields
+        self.displayOutputPaths = displayOutputPaths
         self.sampleRowID = sampleRowID
         self.sampleOutputID = sampleOutputID
         self.samplePreviewOutputIDs = samplePreviewOutputIDs
@@ -292,6 +414,8 @@ struct TestCaseCriteriaPreview: Identifiable {
 
 struct CriterionRunResult: Identifiable, Codable, Hashable {
     let criterionID: UUID
+    let parentCriterionID: UUID?
+    let parentCriterionName: String?
     let name: String
     let expected: String
     let outputPath: String
@@ -307,6 +431,8 @@ struct TestRunRowResult: Identifiable, Codable, Hashable {
     let rowID: UUID
     let variables: [String: String]
     let expectedValues: [String: String]
+    let displayDatasetValues: [String: String]?
+    let displayOutputValues: [String: String]?
     let criterionResults: [CriterionRunResult]
     let latencyMilliseconds: Double
     let inputTokens: Int?
@@ -343,6 +469,8 @@ struct SavedTestRun: Identifiable, Codable, Hashable {
     let provider: String
     let modelID: String
     let criteria: [TestCriterionDefinition]
+    let displayDatasetFields: [String]?
+    let displayOutputPaths: [String]?
     let requestedCount: Int
     let status: TestRunStatus
     let startedAt: Date
@@ -424,6 +552,12 @@ enum TestRunStore {
         let resultURL = folder.appendingPathComponent("test-result.json")
         let outputURL = folder.appendingPathComponent("llm-outputs.json")
         let csvURL = folder.appendingPathComponent("test-result.csv")
+        for url in [resultURL, outputURL, csvURL] where FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.setAttributes(
+                [.immutable: false, .posixPermissions: 0o644],
+                ofItemAtPath: url.path
+            )
+        }
         try encoder.encode(run).write(to: resultURL, options: .atomic)
         try encoder.encode(outputs).write(to: outputURL, options: .atomic)
         try csv(run).write(to: csvURL, atomically: true, encoding: .utf8)
@@ -456,6 +590,14 @@ enum TestRunStore {
         .sorted { $0.completedAt > $1.completedAt }
     }
 
+    static func loadOutputs(for id: UUID) throws -> [LLMOutputRecord] {
+        let url = try folderURL(for: id).appendingPathComponent("llm-outputs.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([LLMOutputRecord].self, from: Data(contentsOf: url))
+    }
+
     static func folderURL(for id: UUID) throws -> URL {
         try rootURL().appendingPathComponent(id.uuidString, isDirectory: true)
     }
@@ -482,8 +624,19 @@ enum TestRunStore {
     private static func csv(_ run: SavedTestRun) -> String {
         let variableHeaders = Array(Set(run.rows.flatMap { $0.variables.keys })).sorted()
         let expectedHeaders = Array(Set(run.rows.flatMap { $0.expectedValues.keys })).sorted()
-        let criterionHeaders = run.criteria.flatMap { criterion in
-            ["criterion.\(criterion.name).expected", "criterion.\(criterion.name).actual", "criterion.\(criterion.name).pass"]
+        let resultDefinitions = run.criteria.flatMap { criterion -> [(UUID, String)] in
+            let condition = criterion.withDefaultArrayAssertions()
+            if condition.valueType == .arrayObject {
+                return condition.arrayAssertions.map { ($0.id, $0.name) }
+            }
+            return [(criterion.id, criterion.name)]
+        }
+        let criterionHeaders = resultDefinitions.flatMap { definition in
+            [
+                "criterion.\(definition.1).expected",
+                "criterion.\(definition.1).actual",
+                "criterion.\(definition.1).pass",
+            ]
         }
         let fixedHeaders = ["latency_ms", "input_tokens", "output_tokens", "test_model", "llm_output", "error"]
         let headers = variableHeaders + expectedHeaders + criterionHeaders + fixedHeaders
@@ -491,8 +644,8 @@ enum TestRunStore {
             let criterionByID = Dictionary(uniqueKeysWithValues: row.criterionResults.map { ($0.criterionID, $0) })
             var values = variableHeaders.map { row.variables[$0] ?? "" }
             values += expectedHeaders.map { row.expectedValues[$0] ?? "" }
-            for criterion in run.criteria {
-                let result = criterionByID[criterion.id]
+            for definition in resultDefinitions {
+                let result = criterionByID[definition.0]
                 values += [result?.expected ?? "", result?.actual ?? "", result.map { String($0.passed) } ?? ""]
             }
             values += [
@@ -518,10 +671,9 @@ enum TestResultEvaluator {
         headers: [String],
         variableFields: [String],
         sampleValues: [String: String],
-        output: String
+        outputPaths: [String]
     ) -> [TestCriterionDefinition] {
         let expectedFields = headers.filter { !variableFields.contains($0) }
-        let outputPaths = JSONValueExtractor.paths(in: output)
         var consumed = Set(["expected_risk_count"])
         var criteria: [TestCriterionDefinition] = []
 
@@ -538,8 +690,8 @@ enum TestResultEvaluator {
                         expectedMinField: minimumField,
                         expectedMaxField: maximumField,
                         outputPath: riskArrayPath(in: outputPaths),
-                        valueType: .json,
-                        passRule: .arrayObjectCondition,
+                        valueType: .arrayObject,
+                        passRule: .exact,
                         matchField: "risk_type",
                         matchValue: riskType,
                         valueField: "risk_score",
@@ -597,30 +749,50 @@ enum TestResultEvaluator {
         values: [String: String],
         output: String
     ) -> [CriterionRunResult] {
-        criteria.map { criterion in
-            var actual = JSONValueExtractor.value(at: criterion.outputPath, in: output) ?? ""
+        criteria.flatMap { criterion in
+            if criterion.valueType == .arrayObject {
+                let assertions = criterion.arrayAssertions.isEmpty
+                    ? criterion.withDefaultArrayAssertions().arrayAssertions
+                    : criterion.arrayAssertions
+                guard !assertions.isEmpty else {
+                    return [CriterionRunResult(
+                        criterionID: criterion.id,
+                        parentCriterionID: nil,
+                        parentCriterionName: nil,
+                        name: criterion.name,
+                        expected: "하위 조건을 하나 이상 설정하세요",
+                        outputPath: criterion.outputPath,
+                        actual: "설정된 조건 없음",
+                        passRule: criterion.passRule.rawValue,
+                        passed: false
+                    )]
+                }
+                return evaluateArrayAssertions(
+                    criterion: criterion,
+                    assertions: assertions,
+                    values: values,
+                    output: output
+                ).map { evaluation in
+                    CriterionRunResult(
+                        criterionID: evaluation.assertion.id,
+                        parentCriterionID: criterion.id,
+                        parentCriterionName: criterion.name,
+                        name: evaluation.assertion.name,
+                        expected: evaluation.expected,
+                        outputPath: criterion.outputPath,
+                        actual: evaluation.actual,
+                        passRule: criterion.passRule.rawValue,
+                        passed: evaluation.passed
+                    )
+                }
+            }
+
+            let actual = JSONValueExtractor.value(at: criterion.outputPath, in: output) ?? ""
             let expected: String
             let passed: Bool
             switch criterion.passRule {
             case .arrayObjectCondition:
-                let assertions = criterion.arrayAssertions.isEmpty
-                    ? criterion.withDefaultArrayAssertions().arrayAssertions
-                    : criterion.arrayAssertions
-                if assertions.isEmpty {
-                    expected = "하위 조건을 하나 이상 설정하세요"
-                    actual = "설정된 조건 없음"
-                    passed = false
-                } else {
-                    let evaluations = evaluateArrayAssertions(
-                        criterion: criterion,
-                        assertions: assertions,
-                        values: values,
-                        output: output
-                    )
-                    expected = evaluations.map(\.expected).joined(separator: " / ")
-                    actual = evaluations.map(\.actual).joined(separator: " / ")
-                    passed = evaluations.allSatisfy(\.passed)
-                }
+                return []
             case .range:
                 let minimum = Double(values[criterion.expectedMinField] ?? "")
                 let maximum = Double(values[criterion.expectedMaxField] ?? "")
@@ -643,15 +815,17 @@ enum TestResultEvaluator {
                         .caseInsensitiveCompare(actual.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
                 }
             }
-            return CriterionRunResult(
+            return [CriterionRunResult(
                 criterionID: criterion.id,
+                parentCriterionID: nil,
+                parentCriterionName: nil,
                 name: criterion.name,
                 expected: expected,
                 outputPath: criterion.outputPath,
                 actual: actual,
                 passRule: criterion.passRule.rawValue,
                 passed: passed
-            )
+            )]
         }
     }
 
@@ -663,6 +837,7 @@ enum TestResultEvaluator {
     ) -> [ArrayObjectAssertionEvaluation] {
         let activeAssertions = assertions ?? criterion.arrayAssertions
         guard !activeAssertions.isEmpty else { return [] }
+        let isEmptyArray = JSONValueExtractor.isEmptyArray(at: criterion.outputPath, in: output)
 
         let matchField = criterion.matchField ?? "risk_type"
         let matchValue = criterion.matchValue ?? ""
@@ -680,15 +855,24 @@ enum TestResultEvaluator {
         }
 
         return activeAssertions.map { assertion in
+            if assertion.allowEmptyArray, isEmptyArray {
+                return ArrayObjectAssertionEvaluation(
+                    assertion: assertion,
+                    expected: "빈 배열 허용",
+                    actual: "빈 배열",
+                    passed: true
+                )
+            }
             switch assertion.kind {
             case .datasetValue:
                 let datasetValue = values[assertion.datasetField] ?? ""
-                let shouldExist = datasetValue == assertion.expectedValue
+                let expected = datasetValue == assertion.expectedValue ? "1" : "0"
+                let actual = match == nil ? "0" : "1"
                 return ArrayObjectAssertionEvaluation(
                     assertion: assertion,
-                    expected: "데이터셋의 \(assertion.datasetField)는 값이 \(assertion.expectedValue)이어야 합니다.",
-                    actual: "데이터셋 값 \(datasetValue.isEmpty ? "-" : datasetValue) · 요소 \(match == nil ? "없음" : "있음")",
-                    passed: shouldExist ? match != nil : match == nil
+                    expected: expected,
+                    actual: actual,
+                    passed: expected == actual
                 )
             case .objectValueRange:
                 let minimum = Double(values[assertion.minimumField] ?? "")
@@ -701,12 +885,12 @@ enum TestResultEvaluator {
                     valueField: valueField,
                     in: output
                 )
-                let expected = "해당 요소의 \(valueField)는 \(assertion.minimumField) 이상 \(assertion.maximumField) 이하여야 합니다."
+                let expected = "\(values[assertion.minimumField] ?? "-")-\(values[assertion.maximumField] ?? "-")"
                 if measured == nil, absenceExpected {
                     return ArrayObjectAssertionEvaluation(
                         assertion: assertion,
                         expected: expected,
-                        actual: "요소 없음 · 범위 검사 제외",
+                        actual: "-",
                         passed: true
                     )
                 }
@@ -715,8 +899,77 @@ enum TestResultEvaluator {
                 return ArrayObjectAssertionEvaluation(
                     assertion: assertion,
                     expected: expected,
-                    actual: measured?.display ?? "요소 없음",
+                    actual: measured?.display ?? "-",
                     passed: passed
+                )
+            case .objectValueAllowedValues:
+                let allowedValues = assertion.expectedValue
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                let observed = JSONValueExtractor.objectValues(
+                    atArrayPath: criterion.outputPath,
+                    field: assertion.objectField,
+                    in: output
+                )
+                let expected = allowedValues.joined(separator: ", ")
+                let passed = !observed.isEmpty && observed.allSatisfy { observed in
+                    allowedValues.contains {
+                        $0.caseInsensitiveCompare(observed) == .orderedSame
+                    }
+                }
+                return ArrayObjectAssertionEvaluation(
+                    assertion: assertion,
+                    expected: expected,
+                    actual: observed.isEmpty ? "-" : observed.joined(separator: ", "),
+                    passed: passed
+                )
+            case .arrayValueRequired:
+                let requiredValues = assertion.expectedValue
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                let observed = JSONValueExtractor.objectValues(
+                    atArrayPath: criterion.outputPath,
+                    field: assertion.objectField,
+                    in: output
+                )
+                let requiredObserved = observed.filter { value in
+                    requiredValues.contains {
+                        $0.caseInsensitiveCompare(value) == .orderedSame
+                    }
+                }
+                let passed = !requiredValues.isEmpty && requiredValues.allSatisfy { required in
+                    observed.contains {
+                        $0.caseInsensitiveCompare(required) == .orderedSame
+                    }
+                }
+                return ArrayObjectAssertionEvaluation(
+                    assertion: assertion,
+                    expected: requiredValues.joined(separator: ", "),
+                    actual: requiredObserved.isEmpty ? "-" : requiredObserved.joined(separator: ", "),
+                    passed: passed
+                )
+            case .arrayValueForbidden:
+                let forbiddenValues = assertion.expectedValue
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                let observed = JSONValueExtractor.objectValues(
+                    atArrayPath: criterion.outputPath,
+                    field: assertion.objectField,
+                    in: output
+                )
+                let forbiddenObserved = observed.filter { value in
+                    forbiddenValues.contains {
+                        $0.caseInsensitiveCompare(value) == .orderedSame
+                    }
+                }
+                return ArrayObjectAssertionEvaluation(
+                    assertion: assertion,
+                    expected: forbiddenValues.joined(separator: ", "),
+                    actual: forbiddenObserved.isEmpty ? "-" : forbiddenObserved.joined(separator: ", "),
+                    passed: forbiddenObserved.isEmpty
                 )
             }
         }
@@ -773,6 +1026,28 @@ enum JSONValueExtractor {
         return Array(Set(objects.compactMap { $0[field].map(stringify) })).sorted()
     }
 
+    static func isEmptyArray(at path: String, in output: String) -> Bool {
+        guard let array = rawValue(at: path, in: output) as? [Any] else { return false }
+        return array.isEmpty
+    }
+
+    static func objectFieldValue(
+        arrayPath: String,
+        matchField: String,
+        matchValue: String,
+        field: String,
+        in output: String
+    ) -> String? {
+        guard let objects = rawValue(at: arrayPath, in: output) as? [[String: Any]],
+              let object = objects.first(where: {
+                  ($0[matchField].map(stringify) ?? "")
+                      .caseInsensitiveCompare(matchValue) == .orderedSame
+              }) else {
+            return nil
+        }
+        return object[field].map(stringify)
+    }
+
     static func objectMatch(
         arrayPath: String,
         matchField: String,
@@ -795,23 +1070,35 @@ enum JSONValueExtractor {
     }
 
     private static func rawValue(at path: String, in output: String) -> Any? {
-        guard !path.isEmpty, var current = parse(output) else { return nil }
+        guard !path.isEmpty, let root = parse(output) else { return nil }
+        var currentValues: [Any] = [root]
+        var usesArrayWildcard = false
         for component in path.split(separator: ".").map(String.init) {
             if let open = component.firstIndex(of: "["), component.hasSuffix("]") {
                 let key = String(component[..<open])
                 let indexText = component[component.index(after: open)..<component.index(before: component.endIndex)]
-                if !key.isEmpty {
-                    guard let dictionary = current as? [String: Any], let next = dictionary[key] else { return nil }
-                    current = next
+                let arrays = currentValues.compactMap { current -> [Any]? in
+                    if key.isEmpty { return current as? [Any] }
+                    return (current as? [String: Any])?[key] as? [Any]
                 }
-                guard let index = Int(indexText), let array = current as? [Any], array.indices.contains(index) else { return nil }
-                current = array[index]
+                if indexText.isEmpty {
+                    usesArrayWildcard = true
+                    currentValues = arrays.flatMap { $0 }
+                } else if let index = Int(indexText) {
+                    currentValues = arrays.compactMap { array in
+                        array.indices.contains(index) ? array[index] : nil
+                    }
+                } else {
+                    return nil
+                }
             } else {
-                guard let dictionary = current as? [String: Any], let next = dictionary[component] else { return nil }
-                current = next
+                currentValues = currentValues.compactMap { current in
+                    (current as? [String: Any])?[component]
+                }
             }
+            guard !currentValues.isEmpty else { return nil }
         }
-        return current
+        return currentValues.count == 1 && !usesArrayWildcard ? currentValues[0] : currentValues
     }
 
     private static func parse(_ output: String) -> Any? {
@@ -835,7 +1122,7 @@ enum JSONValueExtractor {
                 result.append(prefix)
             }
             if let first = array.first {
-                collectPaths(first, prefix: "\(prefix)[0]", into: &result)
+                collectPaths(first, prefix: "\(prefix)[]", into: &result)
             }
         } else if !prefix.isEmpty {
             result.append(prefix)

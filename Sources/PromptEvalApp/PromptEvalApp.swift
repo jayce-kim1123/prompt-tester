@@ -53,6 +53,13 @@ private enum AppSection: String, CaseIterable, Identifiable {
     }
 }
 
+private enum PromptViewMode: String, CaseIterable, Identifiable {
+    case editor = "원문 편집"
+    case structured = "구조화 보기"
+
+    var id: String { rawValue }
+}
+
 private enum EvaluationJudgementSort: String, CaseIterable, Identifiable {
     case tokens = "소모 토큰"
     case latency = "레이턴시"
@@ -97,8 +104,17 @@ struct ContentView: View {
     @State private var maximumTestTokenFilter = ""
     @State private var minimumTestLatencyFilter = ""
     @State private var maximumTestLatencyFilter = ""
+    @State private var testCasePromptFilter = ""
+    @State private var testCaseDatasetFilter = ""
+    @State private var testRunPromptFilter = ""
+    @State private var testRunDatasetFilter = ""
+    @State private var evaluationPromptFilter = ""
+    @State private var evaluationDatasetFilter = ""
     @State private var isTestExecutionExpanded = true
     @State private var isEvaluationExecutionExpanded = true
+    @State private var promptViewMode: PromptViewMode = .editor
+    @State private var isPromptOutputSchemaExpanded = true
+    @FocusState private var isCriterionTextFieldFocused: Bool
 
     var body: some View {
         NavigationSplitView {
@@ -132,6 +148,18 @@ struct ContentView: View {
         } message: {
             Text(state.alertMessage ?? "")
         }
+        .overlay(alignment: .topTrailing) {
+            if let notification = state.notification {
+                ToastView(message: notification.message) {
+                    state.notification = nil
+                }
+                .padding(20)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .onChange(of: state.notification?.id) { _, _ in
+            dismissNotificationAfterDelay()
+        }
     }
 
     private var workspaceView: some View {
@@ -149,14 +177,13 @@ struct ContentView: View {
     }
 
     private var promptLibraryView: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            pageHeader(title: "프롬프트", subtitle: "프롬프트를 등록하고 편집하거나 파일로 가져오고 내보냅니다.")
+        VStack(alignment: .leading, spacing: 16) {
+            pageHeader(title: "프롬프트")
             HSplitView {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("등록된 프롬프트")
                             .font(.headline)
-                        Spacer()
                         Button { state.newPrompt() } label: { Image(systemName: "plus") }
                             .help("새 프롬프트")
                     }
@@ -172,6 +199,22 @@ struct ContentView: View {
                                     .foregroundStyle(.secondary)
                             }
                             .tag(Optional(prompt.id))
+                            .contextMenu {
+                                Button("편집") { state.selectPrompt(prompt.id) }
+                                Button("복제") {
+                                    state.selectPrompt(prompt.id)
+                                    state.duplicateSelectedPrompt()
+                                }
+                                Button("내보내기") {
+                                    state.selectPrompt(prompt.id)
+                                    state.exportCurrentPrompt()
+                                }
+                                Divider()
+                                Button("삭제", role: .destructive) {
+                                    state.selectPrompt(prompt.id)
+                                    state.deleteSelectedPrompt()
+                                }
+                            }
                         }
                     }
                     Button { state.choosePrompt() } label: {
@@ -182,14 +225,14 @@ struct ContentView: View {
                 .padding(.trailing, 10)
 
                 VStack(alignment: .leading, spacing: 12) {
-                    TextField("프롬프트 이름", text: $state.promptName)
-                        .font(.title3.weight(.semibold))
-                    ScrollablePromptEditor(text: $state.promptText)
-                        .frame(minHeight: 420)
                     HStack {
                         Button { state.saveCurrentPrompt() } label: {
                             Label("저장", systemImage: "square.and.arrow.down")
                         }
+                        Button { state.duplicateSelectedPrompt() } label: {
+                            Label("복제", systemImage: "doc.on.doc")
+                        }
+                        .disabled(state.selectedPromptID == nil)
                         Button { state.exportCurrentPrompt() } label: {
                             Label("내보내기", systemImage: "square.and.arrow.up")
                         }
@@ -197,10 +240,52 @@ struct ContentView: View {
                             Label("삭제", systemImage: "trash")
                         }
                         .disabled(state.selectedPromptID == nil)
-                        Spacer()
-                        Text("변수 \(state.promptVariables.count)개")
-                            .foregroundStyle(.secondary)
                     }
+                    Divider()
+                    HStack {
+                        LabeledInput("프롬프트 이름") {
+                            TextField("", text: $state.promptName)
+                                .labelsHidden()
+                                .font(.title3.weight(.semibold))
+                        }
+                        LabeledInput("보기") {
+                            Picker("", selection: $promptViewMode) {
+                                ForEach(PromptViewMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                    }
+                    if promptViewMode == .editor {
+                        ScrollablePromptEditor(text: $state.promptText)
+                            .frame(minHeight: 420)
+                    } else {
+                        PromptStructuredView(text: state.promptText)
+                            .frame(minHeight: 420)
+                    }
+                    DisclosureGroup(isExpanded: $isPromptOutputSchemaExpanded) {
+                        if let schema = state.promptOutputSchema {
+                            ScrollView {
+                                Text(schema.exampleJSON)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(minHeight: 90, maxHeight: 180)
+                        } else {
+                            Text("프롬프트에서 유효한 JSON output 스키마를 찾지 못했습니다.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } label: {
+                        Label("예시 output", systemImage: "curlybraces")
+                            .font(.headline)
+                    }
+                    Text("변수 \(state.promptVariables.count)개")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     if !state.promptVariables.isEmpty {
                         FlowLayout(spacing: 6) {
                             ForEach(state.promptVariables, id: \.self) { variable in
@@ -220,8 +305,8 @@ struct ContentView: View {
     }
 
     private var datasetLibraryView: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            pageHeader(title: "데이터셋", subtitle: "등록된 원본 데이터셋을 확인하고 가져오기·내보내기·삭제를 관리합니다. 데이터셋 내용은 읽기 전용입니다.")
+        VStack(alignment: .leading, spacing: 16) {
+            pageHeader(title: "데이터셋")
             HStack {
                 Button { state.chooseDataset() } label: {
                     Label("파일 가져오기", systemImage: "square.and.arrow.down")
@@ -235,7 +320,6 @@ struct ContentView: View {
                     Label("삭제", systemImage: "trash")
                 }
                 .disabled(state.selectedDatasetID == nil || state.isRunning)
-                Spacer()
                 Text("총 \(state.sourceDatasets.count)개")
                     .foregroundStyle(.secondary)
             }
@@ -244,7 +328,15 @@ struct ContentView: View {
                 selection: Binding(
                     get: { state.selectedDatasetID },
                     set: { state.selectDataset($0) }
-                )
+                ),
+                onExport: { dataset in
+                    state.selectDataset(dataset.id)
+                    state.exportDataset()
+                },
+                onDelete: { dataset in
+                    state.selectDataset(dataset.id)
+                    state.deleteSelectedDataset()
+                }
             )
             .frame(minHeight: 220, idealHeight: 280)
 
@@ -256,41 +348,39 @@ struct ContentView: View {
                                 .font(.headline)
                             Text("\(state.rows.count)개 행")
                                 .foregroundStyle(.secondary)
-                            Spacer()
-                            Text("읽기 전용")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                         if !state.rows.isEmpty {
                             DatasetPreview(headers: state.headers, rows: state.rows)
                                 .id(state.selectedDatasetID)
                         } else {
-                            ContentUnavailableView("데이터가 없습니다", systemImage: "tablecells", description: Text("CSV 또는 JSON 파일을 가져와 데이터셋을 등록하세요."))
-                                .frame(height: 120)
+                            ContentUnavailableView("데이터가 없습니다", systemImage: "tablecells")
+                                .frame(maxWidth: .infinity, minHeight: 120)
                         }
                     }
-                    .padding(.top, 6)
                 }
             }
 
             DisclosureGroup("Google Sheet에서 데이터셋 등록") {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        TextField("스프레드시트 ID", text: $state.spreadsheetID)
-                        TextField("범위", text: $state.spreadsheetRange)
-                            .frame(width: 180)
+                        LabeledInput("스프레드시트 ID") {
+                            TextField("", text: $state.spreadsheetID)
+                                .labelsHidden()
+                        }
+                        LabeledInput("범위") {
+                            TextField("", text: $state.spreadsheetRange)
+                                .labelsHidden()
+                        }
                     }
                     HStack {
-                        SecureField("Google Sheets API 키", text: $state.googleAPIKey)
-                        Button { pasteClipboard(into: $state.googleAPIKey) } label: {
-                            Image(systemName: "doc.on.clipboard")
+                        LabeledInput("Google Sheets API 키") {
+                            SecureField("", text: $state.googleAPIKey)
+                                .labelsHidden()
                         }
-                        .help("클립보드에서 API 키 붙여넣기")
                         Button("시트 불러오기") { state.loadSpreadsheet() }
                             .disabled(state.isRunning)
                     }
                 }
-                .padding(.top, 8)
             }
             Spacer(minLength: 0)
         }
@@ -298,300 +388,315 @@ struct ContentView: View {
     }
 
     private var testCaseView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                pageHeader(title: "테스트 케이스", subtitle: "프롬프트와 원본 데이터셋을 연결하고 output 추출 기준과 PASS 규칙을 저장합니다.")
-
-                HStack {
-                    Picker("저장된 테스트 케이스", selection: Binding(
-                        get: { state.selectedTestCaseID },
-                        set: { state.selectTestCase($0) }
-                    )) {
-                        Text("새 테스트 케이스").tag(UUID?.none)
-                        ForEach(state.savedTestCases) { testCase in
-                            Text(testCase.name).tag(Optional(testCase.id))
+        VStack(alignment: .leading, spacing: 16) {
+            pageHeader(title: "테스트 케이스")
+            HSplitView {
+                testCaseSidebar
+                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 340)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Button { state.saveCurrentTestCase() } label: {
+                            Label("저장", systemImage: "square.and.arrow.down")
                         }
+                        Button { state.duplicateSelectedTestCase() } label: {
+                            Label("복제", systemImage: "doc.on.doc")
+                        }
+                        .disabled(state.selectedTestCaseID == nil)
+                        Button(role: .destructive) { state.deleteSelectedTestCase() } label: {
+                            Label("삭제", systemImage: "trash")
+                        }
+                        .disabled(state.selectedTestCaseID == nil)
+                        Spacer()
                     }
-                    .frame(maxWidth: 420)
-                    Button { state.newTestCase() } label: {
-                        Label("새로 만들기", systemImage: "plus")
-                    }
-                    Button { state.saveCurrentTestCase() } label: {
-                        Label("저장", systemImage: "square.and.arrow.down")
-                    }
-                    Button(role: .destructive) { state.deleteSelectedTestCase() } label: {
-                        Label("삭제", systemImage: "trash")
-                    }
-                    .disabled(state.selectedTestCaseID == nil)
-                    Spacer()
-                }
-
-                GroupBox("1. 입력과 실행 모델") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        TextField("테스트 케이스 이름", text: $state.testCaseName)
-                        HStack {
-                            Picker("프롬프트", selection: Binding(
-                                get: { state.selectedPromptID },
-                                set: { state.selectPrompt($0) }
-                            )) {
-                                Text("프롬프트 선택").tag(UUID?.none)
-                                ForEach(state.savedPrompts) { prompt in
-                                    Text(prompt.name).tag(Optional(prompt.id))
+                    Divider()
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                WorkflowSection {
+                    VStack(alignment: .leading, spacing: 12) {
+                        LabeledInput("테스트 케이스 이름") {
+                            TextField("", text: $state.testCaseName)
+                                .labelsHidden()
+                        }
+                        VStack(alignment: .leading, spacing: 12) {
+                            LabeledInput("프롬프트") {
+                                Picker("", selection: Binding(
+                                    get: { state.selectedPromptID },
+                                    set: { state.selectPrompt($0) }
+                                )) {
+                                    Text("선택").tag(UUID?.none)
+                                    ForEach(state.savedPrompts) { prompt in
+                                        Text(prompt.name).tag(Optional(prompt.id))
+                                    }
                                 }
+                                .labelsHidden()
                             }
-                            Picker("원본 데이터셋", selection: Binding(
-                                get: { state.selectedDatasetID },
-                                set: { state.selectDataset($0) }
-                            )) {
-                                Text("데이터셋 선택").tag(UUID?.none)
-                                ForEach(state.sourceDatasets) { dataset in
-                                    Text(dataset.name).tag(Optional(dataset.id))
+                            LabeledInput("데이터셋") {
+                                Picker("", selection: Binding(
+                                    get: { state.selectedDatasetID },
+                                    set: { state.selectDataset($0) }
+                                )) {
+                                    Text("선택").tag(UUID?.none)
+                                    ForEach(state.sourceDatasets) { dataset in
+                                        Text(dataset.name).tag(Optional(dataset.id))
+                                    }
                                 }
+                                .labelsHidden()
                             }
                         }
                         HStack {
-                            Picker("제공 서비스", selection: $state.provider) {
-                                ForEach(ProviderKind.allCases) { provider in
-                                    Text(provider.rawValue).tag(provider)
+                            LabeledInput("제공 서비스") {
+                                Picker("", selection: $state.provider) {
+                                    ForEach(ProviderKind.allCases) { provider in
+                                        Text(provider.rawValue).tag(provider)
+                                    }
                                 }
+                                .labelsHidden()
                             }
-                            .frame(width: 230)
-                            SecureField("API 키", text: $state.providerAPIKey)
-                            Button { pasteClipboard(into: $state.providerAPIKey) } label: {
-                                Image(systemName: "doc.on.clipboard")
+                            LabeledInput("API 키") {
+                                SecureField("", text: $state.providerAPIKey)
+                                    .labelsHidden()
+                                    .onSubmit { state.loadModels() }
                             }
-                            .help("클립보드에서 API 키 붙여넣기")
                             Button { state.loadModels() } label: {
                                 Label("모델 연결", systemImage: "arrow.clockwise")
                             }
                             .disabled(state.providerAPIKey.isEmpty || state.isLoadingModels)
                         }
                         HStack {
-                            if !state.models.isEmpty {
-                                Picker("실행 모델", selection: $state.selectedModelID) {
+                            LabeledInput("실행 모델") {
+                                Picker("", selection: $state.selectedModelID) {
+                                    Text("선택").tag("")
                                     ForEach(state.models) { model in
                                         Text(model.name).tag(model.id)
                                     }
                                 }
-                                .frame(maxWidth: 420)
+                                .labelsHidden()
+                                .disabled(state.models.isEmpty)
                             }
-                            TextField("실행 모델 ID", text: $state.selectedModelID)
-                                .frame(maxWidth: 320)
-                            Spacer()
                             Label("변수 \(state.promptVariables.count)개", systemImage: "curlybraces")
                             Label("기댓값 필드 \(state.testCaseExpectedFields.count)개", systemImage: "target")
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.top, 6)
                 }
 
-                GroupBox("2. LLM output 구조 추출") {
-                    VStack(alignment: .leading, spacing: 9) {
+                WorkflowSection {
+                    VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Button { state.runTestCasePreview() } label: {
-                                Label(state.isPreviewingTestCase ? "추출 중" : "첫 행 output 추출", systemImage: "play.fill")
+                            Text("결과에 표시할 값")
+                                .font(.headline)
+                            Button("선택 해제") {
+                                state.testCaseDisplayDatasetFields = []
+                                state.testCaseDisplayOutputPaths = []
                             }
-                            .disabled(state.isPreviewingTestCase || state.rows.isEmpty || state.promptText.isEmpty || state.selectedModelID.isEmpty)
-                            if let output = state.sampleOutput {
-                                Text("\(formatLatency(output.latencyMilliseconds)) · 토큰 \(formatTokens(output.inputTokens))/\(formatTokens(output.outputTokens)) · \(output.modelID)")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
+                            .disabled(
+                                state.testCaseDisplayDatasetFields.isEmpty
+                                    && state.testCaseDisplayOutputPaths.isEmpty
+                            )
                         }
-                        if let output = state.sampleOutput?.output {
-                            ScrollView {
-                                Text(output)
-                                    .font(.caption.monospaced())
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(minHeight: 120, maxHeight: 210)
-                        } else {
-                            Text("첫 번째 데이터 행의 LLM output을 가져와 선택 가능한 JSON 필드를 만듭니다.")
-                                .foregroundStyle(.secondary)
+                        HStack(alignment: .top, spacing: 18) {
+                            datasetPreviewFieldSelection(
+                                headers: state.headers,
+                                rows: Array(state.rows.prefix(5)),
+                                selection: $state.testCaseDisplayDatasetFields,
+                            )
+                            Divider()
+                                .frame(height: 150)
+                            outputExampleFieldSelection(
+                                schema: state.promptOutputSchema,
+                                selection: $state.testCaseDisplayOutputPaths
+                            )
                         }
+                        resultDisplaySelectionChips(
+                            datasetFields: state.testCaseDisplayDatasetFields,
+                            outputPaths: state.testCaseDisplayOutputPaths
+                        )
                     }
-                    .padding(.top, 6)
                 }
 
-                GroupBox("3. 평가 기준 매핑과 PASS 범위") {
-                    VStack(alignment: .leading, spacing: 10) {
+                WorkflowSection {
+                    VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Text("추천 모델")
-                            Picker("추천 모델", selection: $state.codexEvaluationModel) {
-                                ForEach(state.codexEvaluationModelOptions, id: \.self) { model in
-                                    Text(model).tag(model)
+                            LabeledInput("추천 모델") {
+                                Picker("", selection: $state.codexEvaluationModel) {
+                                    ForEach(state.codexEvaluationModelOptions, id: \.self) { model in
+                                        Text(model).tag(model)
+                                    }
                                 }
+                                .labelsHidden()
                             }
-                            .labelsHidden()
-                            .frame(width: 220)
                             Button { state.recommendCriteriaWithCodex() } label: {
                                 Label(state.isRecommendingCriteria ? "추천 중" : "AI로 다시 추천", systemImage: "wand.and.stars")
                             }
-                            .disabled(state.sampleOutput?.output == nil || state.isRecommendingCriteria)
-                            Button { state.addTestCriterion() } label: {
-                                Label("기준 추가", systemImage: "plus")
-                            }
-                            Spacer()
+                            .disabled(state.promptOutputSchema == nil || state.isRecommendingCriteria)
                         }
 
-                        if state.testCaseCriteria.isEmpty {
-                            Text("정량 평가 기준은 선택사항입니다. 기준 없이 저장하면 Codex가 원본 프롬프트와 전체 output을 정성 평가합니다.")
-                                .foregroundStyle(.secondary)
-                        } else {
+                        if !state.testCaseCriteria.isEmpty {
                             ForEach($state.testCaseCriteria) { $criterion in
-                                let outputPathOptions = Array(Set(state.sampleOutputPaths + [criterion.outputPath]))
+                                let outputPathOptions = Array(Set(state.promptOutputSchemaPaths + [criterion.outputPath]))
                                     .filter { !$0.isEmpty }
                                     .sorted()
-                                let objectFieldOptions = Array(Set(
-                                    state.arrayObjectFields(at: criterion.outputPath) + [criterion.matchField ?? "", criterion.valueField ?? ""]
-                                ))
-                                .filter { !$0.isEmpty }
-                                .sorted()
-                                let matchValueOptions = Array(Set(
-                                    state.arrayObjectValues(
-                                        at: criterion.outputPath,
-                                        field: criterion.matchField ?? ""
-                                    ) + [criterion.matchValue ?? ""]
-                                ))
-                                .filter { !$0.isEmpty }
-                                .sorted()
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
-                                        TextField("기준 이름", text: $criterion.name)
-                                            .frame(width: 170)
-                                        Picker("값 타입", selection: $criterion.valueType) {
-                                            ForEach(CriterionValueType.allCases) { type in
-                                                Text(type.rawValue).tag(type)
+                                        LabeledInput("조건 이름") {
+                                            TextField("", text: $criterion.name)
+                                                .labelsHidden()
+                                                .focused($isCriterionTextFieldFocused)
+                                        }
+                                        LabeledInput("값 타입") {
+                                            Picker("", selection: $criterion.valueType) {
+                                                ForEach(CriterionValueType.allCases) { type in
+                                                    Text(type.rawValue).tag(type)
+                                                }
+                                            }
+                                            .labelsHidden()
+                                            .onChange(of: criterion.valueType) { _, type in
+                                                if type == .number,
+                                                   !criterion.expectedMinField.isEmpty,
+                                                   !criterion.expectedMaxField.isEmpty {
+                                                    criterion.passRule = .range
+                                                } else if type == .arrayObject || criterion.passRule == .range {
+                                                    criterion.passRule = .exact
+                                                }
                                             }
                                         }
-                                        .frame(width: 150)
-                                        .onChange(of: criterion.valueType) { _, type in
-                                            if type == .number,
-                                               !criterion.expectedMinField.isEmpty,
-                                               !criterion.expectedMaxField.isEmpty {
-                                                criterion.passRule = .range
-                                            } else if criterion.passRule == .range {
-                                                criterion.passRule = .exact
+                                        if criterion.valueType != .arrayObject {
+                                            LabeledInput("PASS 규칙") {
+                                                Picker("", selection: $criterion.passRule) {
+                                                    ForEach(PassRuleType.allCases) { rule in
+                                                        Text(rule.rawValue).tag(rule)
+                                                    }
+                                                }
+                                                .labelsHidden()
                                             }
                                         }
-                                        Picker("PASS 규칙", selection: $criterion.passRule) {
-                                            ForEach(PassRuleType.allCases) { rule in
-                                                Text(rule.rawValue).tag(rule)
-                                            }
-                                        }
-                                        .frame(width: 150)
-                                        Spacer()
                                         Button(role: .destructive) { state.removeTestCriterion(id: criterion.id) } label: {
                                             Image(systemName: "trash")
                                         }
                                         .help("평가 기준 삭제")
                                     }
-                                    if criterion.passRule == .arrayObjectCondition {
+                                    if criterion.valueType == .arrayObject {
                                         HStack(spacing: 6) {
-                                            Text("만약")
-                                            Picker("배열", selection: $criterion.outputPath) {
-                                                Text("선택").tag("")
-                                                ForEach(outputPathOptions, id: \.self) { path in
-                                                    Text(path).tag(path)
+                                            LabeledInput("배열") {
+                                                Picker("", selection: $criterion.outputPath) {
+                                                    Text("선택").tag("")
+                                                    ForEach(outputPathOptions, id: \.self) { path in
+                                                        Text(path).tag(path)
+                                                    }
                                                 }
+                                                .labelsHidden()
                                             }
-                                            .labelsHidden()
-                                            .frame(width: 270)
-                                            Text("에")
-                                            Picker("일치 필드", selection: Binding(
-                                                get: { criterion.matchField ?? "" },
-                                                set: { criterion.matchField = $0 }
-                                            )) {
-                                                Text("선택").tag("")
-                                                ForEach(objectFieldOptions, id: \.self) { field in
-                                                    Text(field).tag(field)
-                                                }
+                                            Text("의 요소를 검사합니다.")
+                                        }
+
+                                        if criterion.arrayAssertions.contains(where: {
+                                            $0.kind == .datasetValue || $0.kind == .objectValueRange
+                                        }) {
+                                            HStack(spacing: 6) {
+                                                Text("대상 요소는")
+                                                TextField("키", text: Binding(
+                                                    get: { criterion.matchField ?? "" },
+                                                    set: { criterion.matchField = $0 }
+                                                ))
+                                                .focused($isCriterionTextFieldFocused)
+                                                Text("값이")
+                                                TextField("값", text: Binding(
+                                                    get: { criterion.matchValue ?? "" },
+                                                    set: { criterion.matchValue = $0 }
+                                                ))
+                                                .focused($isCriterionTextFieldFocused)
+                                                Text("인 요소입니다.")
                                             }
-                                            .labelsHidden()
-                                            .frame(width: 150)
-                                            Text("값이")
-                                            Picker("일치 값", selection: Binding(
-                                                get: { criterion.matchValue ?? "" },
-                                                set: { criterion.matchValue = $0 }
-                                            )) {
-                                                Text("선택").tag("")
-                                                ForEach(matchValueOptions, id: \.self) { value in
-                                                    Text(value).tag(value)
-                                                }
-                                            }
-                                            .labelsHidden()
-                                            .frame(width: 170)
-                                            Text("인 요소가 있다면")
-                                            Spacer()
                                         }
 
                                         VStack(alignment: .leading, spacing: 6) {
                                             ForEach($criterion.arrayAssertions) { $assertion in
-                                                HStack(spacing: 6) {
-                                                    Text("•")
-                                                        .foregroundStyle(.secondary)
-                                                    switch assertion.kind {
-                                                    case .datasetValue:
-                                                        Text("데이터셋의")
-                                                        Picker("필드", selection: $assertion.datasetField) {
-                                                            Text("선택").tag("")
-                                                            ForEach(state.testCaseExpectedFields, id: \.self) { field in
-                                                                Text(field).tag(field)
-                                                            }
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    HStack(spacing: 10) {
+                                                        LabeledInput("조건 이름") {
+                                                            TextField("", text: $assertion.name)
+                                                                .labelsHidden()
+                                                                .focused($isCriterionTextFieldFocused)
                                                         }
-                                                        .labelsHidden()
-                                                        .frame(width: 220)
-                                                        Text("는 값이")
-                                                        Picker("값", selection: $assertion.expectedValue) {
-                                                            Text("1").tag("1")
-                                                            Text("0").tag("0")
-                                                        }
-                                                        .labelsHidden()
-                                                        .frame(width: 70)
-                                                        Text("이어야 합니다.")
-                                                    case .objectValueRange:
-                                                        Text("해당 요소의")
-                                                        Picker("측정 필드", selection: $assertion.objectField) {
-                                                            Text("선택").tag("")
-                                                            ForEach(objectFieldOptions, id: \.self) { field in
-                                                                Text(field).tag(field)
-                                                            }
-                                                        }
-                                                        .labelsHidden()
-                                                        .frame(width: 170)
-                                                        Text("는")
-                                                        Picker("최솟값 필드", selection: $assertion.minimumField) {
-                                                            Text("선택").tag("")
-                                                            ForEach(state.testCaseExpectedFields, id: \.self) { field in
-                                                                Text(field).tag(field)
-                                                            }
-                                                        }
-                                                        .labelsHidden()
-                                                        .frame(width: 210)
-                                                        Text("이상")
-                                                        Picker("최댓값 필드", selection: $assertion.maximumField) {
-                                                            Text("선택").tag("")
-                                                            ForEach(state.testCaseExpectedFields, id: \.self) { field in
-                                                                Text(field).tag(field)
-                                                            }
-                                                        }
-                                                        .labelsHidden()
-                                                        .frame(width: 210)
-                                                        Text("이하여야 합니다.")
+                                                        Toggle("빈 배열이면 통과", isOn: $assertion.allowEmptyArray)
+                                                            .toggleStyle(.checkbox)
                                                     }
-                                                    Spacer()
-                                                    Button(role: .destructive) {
-                                                        state.removeArrayAssertion(
-                                                            from: criterion.id,
-                                                            assertionID: assertion.id
-                                                        )
-                                                    } label: {
-                                                        Image(systemName: "minus.circle")
+                                                    HStack(spacing: 6) {
+                                                        Text("조건")
+                                                            .foregroundStyle(.secondary)
+                                                        switch assertion.kind {
+                                                        case .datasetValue:
+                                                            Text("데이터셋의")
+                                                            Picker("필드", selection: $assertion.datasetField) {
+                                                                Text("선택").tag("")
+                                                                ForEach(state.testCaseExpectedFields, id: \.self) { field in
+                                                                    Text(field).tag(field)
+                                                                }
+                                                            }
+                                                            .labelsHidden()
+                                                            Text("는 값이")
+                                                            Picker("값", selection: $assertion.expectedValue) {
+                                                                Text("1").tag("1")
+                                                                Text("0").tag("0")
+                                                            }
+                                                            .labelsHidden()
+                                                            Text("이어야 합니다.")
+                                                        case .objectValueRange:
+                                                            Text("해당 요소의")
+                                                            TextField("필드", text: $assertion.objectField)
+                                                            .focused($isCriterionTextFieldFocused)
+                                                            Text("는")
+                                                            Picker("최솟값 필드", selection: $assertion.minimumField) {
+                                                                Text("선택").tag("")
+                                                                ForEach(state.testCaseExpectedFields, id: \.self) { field in
+                                                                    Text(field).tag(field)
+                                                                }
+                                                            }
+                                                            .labelsHidden()
+                                                            Text("이상")
+                                                            Picker("최댓값 필드", selection: $assertion.maximumField) {
+                                                                Text("선택").tag("")
+                                                                ForEach(state.testCaseExpectedFields, id: \.self) { field in
+                                                                    Text(field).tag(field)
+                                                                }
+                                                            }
+                                                            .labelsHidden()
+                                                            Text("이하여야 합니다.")
+                                                        case .objectValueAllowedValues:
+                                                            Text("배열의")
+                                                            TextField("필드", text: $assertion.objectField)
+                                                            .focused($isCriterionTextFieldFocused)
+                                                            Text("값은")
+                                                            TextField("허용 값", text: $assertion.expectedValue)
+                                                                .focused($isCriterionTextFieldFocused)
+                                                            Text("중 하나여야 합니다.")
+                                                        case .arrayValueRequired:
+                                                            Text("배열의")
+                                                            TextField("필드", text: $assertion.objectField)
+                                                            .focused($isCriterionTextFieldFocused)
+                                                            Text("값에")
+                                                            TextField("필수 값", text: $assertion.expectedValue)
+                                                                .focused($isCriterionTextFieldFocused)
+                                                            Text("이 하나 이상 있어야 합니다.")
+                                                        case .arrayValueForbidden:
+                                                            Text("배열의")
+                                                            TextField("필드", text: $assertion.objectField)
+                                                            .focused($isCriterionTextFieldFocused)
+                                                            Text("값에")
+                                                            TextField("금지 값", text: $assertion.expectedValue)
+                                                                .focused($isCriterionTextFieldFocused)
+                                                            Text("이 포함되면 안 됩니다.")
+                                                        }
+                                                Button(role: .destructive) {
+                                                            state.removeArrayAssertion(
+                                                                from: criterion.id,
+                                                                assertionID: assertion.id
+                                                            )
+                                                        } label: {
+                                                            Image(systemName: "minus.circle")
+                                                        }
+                                                        .help("조건 삭제")
                                                     }
-                                                    .help("하위 조건 삭제")
                                                 }
                                                 .font(.caption)
                                             }
@@ -603,36 +708,62 @@ struct ContentView: View {
                                                 Button("요소 값 범위") {
                                                     state.addArrayAssertion(to: criterion.id, kind: .objectValueRange)
                                                 }
+                                                Button("배열 값 허용 목록") {
+                                                    state.addArrayAssertion(to: criterion.id, kind: .objectValueAllowedValues)
+                                                }
+                                                Button("배열 필수 값") {
+                                                    state.addArrayAssertion(to: criterion.id, kind: .arrayValueRequired)
+                                                }
+                                                Button("배열 값 제외") {
+                                                    state.addArrayAssertion(to: criterion.id, kind: .arrayValueForbidden)
+                                                }
                                             } label: {
-                                                Label("하위 조건 추가", systemImage: "plus")
+                                                Label("조건 추가", systemImage: "plus")
                                             }
                                             .font(.caption)
                                         }
-                                        .padding(.leading, 10)
+                                        .padding(.leading, 20)
+                                        .overlay(alignment: .leading) {
+                                            Rectangle()
+                                                .fill(.quaternary)
+                                                .frame(width: 1)
+                                                .padding(.vertical, 2)
+                                        }
                                     } else {
                                         HStack {
                                             if criterion.passRule == .range {
-                                                Picker("최솟값 필드", selection: $criterion.expectedMinField) {
-                                                    Text("선택").tag("")
-                                                    ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                LabeledInput("최솟값") {
+                                                    Picker("", selection: $criterion.expectedMinField) {
+                                                        Text("선택").tag("")
+                                                        ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                    }
+                                                    .labelsHidden()
                                                 }
-                                                Picker("최댓값 필드", selection: $criterion.expectedMaxField) {
-                                                    Text("선택").tag("")
-                                                    ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                LabeledInput("최댓값") {
+                                                    Picker("", selection: $criterion.expectedMaxField) {
+                                                        Text("선택").tag("")
+                                                        ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                    }
+                                                    .labelsHidden()
                                                 }
                                             } else if criterion.passRule != .exists {
-                                                Picker("기댓값 필드", selection: $criterion.expectedField) {
+                                                LabeledInput("기댓값") {
+                                                    Picker("", selection: $criterion.expectedField) {
+                                                        Text("선택").tag("")
+                                                        ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                    }
+                                                    .labelsHidden()
+                                                }
+                                            }
+                                            LabeledInput("Output") {
+                                                Picker("", selection: $criterion.outputPath) {
                                                     Text("선택").tag("")
-                                                    ForEach(state.testCaseExpectedFields, id: \.self) { Text($0).tag($0) }
+                                                    ForEach(outputPathOptions, id: \.self) { path in
+                                                        Text(path).tag(path)
+                                                    }
                                                 }
+                                                .labelsHidden()
                                             }
-                                            Picker("Output 필드", selection: $criterion.outputPath) {
-                                                Text("선택").tag("")
-                                                ForEach(outputPathOptions, id: \.self) { path in
-                                                    Text(path).tag(path)
-                                                }
-                                            }
-                                            .frame(maxWidth: 340)
                                         }
                                     }
                                 }
@@ -640,12 +771,19 @@ struct ContentView: View {
                                 Divider()
                             }
                         }
+                        Button { state.addTestCriterion() } label: {
+                            Image(systemName: "plus")
+                                .frame(maxWidth: .infinity, minHeight: 38)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                        .help("기준 추가")
                     }
-                    .padding(.top, 6)
                 }
 
-                GroupBox("4. 5행 조건 미리보기") {
-                    VStack(alignment: .leading, spacing: 10) {
+                WorkflowSection {
+                    VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Button { state.runCriteriaPreview() } label: {
                                 Label(
@@ -670,61 +808,22 @@ struct ContentView: View {
                                     .font(.caption.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
-                            Spacer()
                         }
 
                         if state.criteriaPreviews.isEmpty {
-                            Text("조건을 설정한 뒤 5개 행을 실행하면, 조건을 수정할 때마다 여기서 PASS/FAIL이 즉시 갱신됩니다.")
+                            Text("미리보기 결과가 없습니다.")
                                 .foregroundStyle(.secondary)
                         } else {
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 8) {
                                     ForEach(state.criteriaPreviews) { preview in
                                         let results = state.criterionResults(for: preview)
-                                        let passed = preview.output.error == nil
-                                            && !results.isEmpty
-                                            && results.allSatisfy(\.passed)
-                                        let rowSummary = preview.row.values.keys.sorted().map {
-                                            "\($0): \(preview.row.values[$0] ?? "")"
-                                        }.joined(separator: " · ")
-                                        VStack(alignment: .leading, spacing: 6) {
-                                            HStack {
-                                                Text(rowSummary)
-                                                    .font(.caption.weight(.semibold))
-                                                    .lineLimit(2)
-                                                Spacer()
-                                                if preview.output.error != nil {
-                                                    Label("실행 오류", systemImage: "exclamationmark.triangle.fill")
-                                                        .foregroundStyle(.red)
-                                                } else {
-                                                    Label(
-                                                        passed ? "PASS" : "FAIL",
-                                                        systemImage: passed ? "checkmark.circle.fill" : "xmark.circle.fill"
-                                                    )
-                                                    .foregroundStyle(passed ? .green : .red)
-                                                }
-                                            }
-                                            if let error = preview.output.error {
-                                                Text(error)
-                                                    .font(.caption)
-                                                    .foregroundStyle(.red)
-                                            } else {
-                                                ForEach(results) { result in
-                                                    HStack {
-                                                        Label(
-                                                            result.name,
-                                                            systemImage: result.passed ? "checkmark.circle" : "xmark.circle"
-                                                        )
-                                                        .foregroundStyle(result.passed ? .green : .red)
-                                                        Text("기대 \(result.expected)")
-                                                        Text("결과 \(result.actual)")
-                                                            .foregroundStyle(.secondary)
-                                                        Spacer()
-                                                    }
-                                                    .font(.caption)
-                                                }
-                                            }
-                                        }
+                                        TestResultRowView(
+                                            criterionResults: results,
+                                            datasetValues: previewDisplayDatasetValues(preview.row),
+                                            outputValues: previewDisplayOutputValues(preview.output),
+                                            error: preview.output.error
+                                        )
                                         .padding(9)
                                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
                                     }
@@ -733,53 +832,298 @@ struct ContentView: View {
                             .frame(minHeight: 180, maxHeight: 360)
                         }
                     }
-                    .padding(.top, 6)
+                }
+                    }
+                    .padding(.leading, 12)
+                }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
             }
-            .padding(24)
+        .padding(24)
+        .onChange(of: state.testCaseCriteria) { _, _ in
+            guard !isCriterionTextFieldFocused else { return }
+            state.commitCriteriaPreviewCriteria()
         }
+        .onChange(of: isCriterionTextFieldFocused) { _, isFocused in
+            guard !isFocused else { return }
+            state.commitCriteriaPreviewCriteria()
+        }
+    }
+
+    private var filteredTestCases: [SavedTestCase] {
+        state.savedTestCases.filter { testCase in
+            (testCasePromptFilter.isEmpty || testCase.promptName == testCasePromptFilter)
+                && (testCaseDatasetFilter.isEmpty || testCase.datasetName == testCaseDatasetFilter)
+        }
+    }
+
+    private var filteredTestRuns: [SavedTestRun] {
+        state.testRuns.filter { run in
+            (testRunPromptFilter.isEmpty || run.promptName == testRunPromptFilter)
+                && (testRunDatasetFilter.isEmpty || run.datasetName == testRunDatasetFilter)
+        }
+    }
+
+    private var filteredEvaluationResults: [EvaluationResultRecord] {
+        state.evaluationResults.filter { result in
+            let promptName = result.input.promptName ?? ""
+            let datasetName = result.input.sourceDatasetName ?? result.input.datasetName ?? ""
+            return (evaluationPromptFilter.isEmpty || promptName == evaluationPromptFilter)
+                && (evaluationDatasetFilter.isEmpty || datasetName == evaluationDatasetFilter)
+        }
+    }
+
+    private func promptDatasetFilters(
+        prompts: [String],
+        datasets: [String],
+        promptSelection: Binding<String>,
+        datasetSelection: Binding<String>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledInput("프롬프트") {
+                Picker("", selection: promptSelection) {
+                    Text("전체").tag("")
+                    ForEach(uniqueSortedNames(prompts), id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+            LabeledInput("데이터셋") {
+                Picker("", selection: datasetSelection) {
+                    Text("전체").tag("")
+                    ForEach(uniqueSortedNames(datasets), id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func uniqueSortedNames(_ values: [String]) -> [String] {
+        Array(Set(values.filter { !$0.isEmpty })).sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+    }
+
+    private func displayFieldSelection(
+        title: String,
+        fields: [String],
+        selection: Binding<[String]>,
+        emptyMessage: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if fields.isEmpty {
+                Text(emptyMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(fields.sorted(), id: \.self) { field in
+                            Toggle(field, isOn: Binding(
+                                get: { selection.wrappedValue.contains(field) },
+                                set: { isSelected in
+                                    var selectedFields = selection.wrappedValue
+                                    if isSelected {
+                                        if !selectedFields.contains(field) {
+                                            selectedFields.append(field)
+                                        }
+                                    } else {
+                                        selectedFields.removeAll { $0 == field }
+                                    }
+                                    selection.wrappedValue = selectedFields
+                                }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                        }
+                    }
+                }
+                .frame(minWidth: 240, maxWidth: .infinity, minHeight: 90, maxHeight: 150)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func outputExampleFieldSelection(
+        schema: PromptOutputSchema?,
+        selection: Binding<[String]>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("아웃풋 미리보기")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let schema {
+                OutputExampleFieldPicker(schema: schema, selection: selection)
+            } else {
+                Text("output 스키마가 없습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func datasetPreviewFieldSelection(
+        headers: [String],
+        rows: [DatasetRow],
+        selection: Binding<[String]>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("데이터셋 미리보기")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if headers.isEmpty || rows.isEmpty {
+                Text("데이터셋을 선택하세요.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+            } else {
+                DatasetPreviewFieldPicker(headers: headers, rows: rows, selection: selection)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func resultDisplaySelectionChips(
+        datasetFields: [String],
+        outputPaths: [String]
+    ) -> some View {
+        if !datasetFields.isEmpty || !outputPaths.isEmpty {
+            FlowLayout(spacing: 6) {
+                ForEach(datasetFields.sorted(), id: \.self) { field in
+                    Button {
+                        state.testCaseDisplayDatasetFields.removeAll { $0 == field }
+                    } label: {
+                        Label(field, systemImage: "tablecells")
+                    }
+                    .buttonStyle(.borderless)
+                }
+                ForEach(outputPaths.sorted(), id: \.self) { path in
+                    Button {
+                        state.testCaseDisplayOutputPaths.removeAll { $0 == path }
+                    } label: {
+                        Label(path, systemImage: "curlybraces")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .font(.caption)
+        }
+    }
+
+    private var testCaseSidebar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("저장된 테스트 케이스")
+                    .font(.headline)
+                Button { state.newTestCase() } label: {
+                    Image(systemName: "plus")
+                }
+                .help("새 테스트 케이스")
+            }
+            promptDatasetFilters(
+                prompts: state.savedTestCases.map(\.promptName),
+                datasets: state.savedTestCases.map(\.datasetName),
+                promptSelection: $testCasePromptFilter,
+                datasetSelection: $testCaseDatasetFilter
+            )
+            List(selection: Binding(
+                get: { state.selectedTestCaseID },
+                set: { state.selectTestCase($0) }
+            )) {
+                ForEach(filteredTestCases) { testCase in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(testCase.name)
+                            .fontWeight(.medium)
+                            .lineLimit(1)
+                        Label(testCase.promptName, systemImage: "text.quote")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Label(testCase.datasetName, systemImage: "tablecells")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Label(testCase.modelID, systemImage: "cpu")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .tag(Optional(testCase.id))
+                    .contextMenu {
+                        Button("편집") { state.selectTestCase(testCase.id) }
+                        Button("복제") {
+                            state.selectTestCase(testCase.id)
+                            state.duplicateSelectedTestCase()
+                        }
+                        Button("저장") {
+                            state.selectTestCase(testCase.id)
+                            state.saveCurrentTestCase()
+                        }
+                        Divider()
+                        Button("삭제", role: .destructive) {
+                            state.selectTestCase(testCase.id)
+                            state.deleteSelectedTestCase()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.trailing, 10)
     }
 
     private var testRunView: some View {
         GeometryReader { _ in
-            VStack(alignment: .leading, spacing: 14) {
-            pageHeader(title: "테스트", subtitle: "저장된 테스트 케이스를 실행하고 LLM output과 테스트 결과를 데이터셋과 별도로 보관합니다.")
-            DisclosureGroup(isExpanded: $isTestExecutionExpanded) {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack {
-                        Picker("테스트 케이스", selection: Binding(
-                            get: { state.selectedTestCaseID },
-                            set: { state.selectTestCase($0) }
-                        )) {
-                            Text("선택").tag(UUID?.none)
-                            ForEach(state.savedTestCases) { testCase in
-                                Text(testCase.name).tag(Optional(testCase.id))
+            VStack(alignment: .leading, spacing: 16) {
+            pageHeader(title: "테스트")
+            CollapsibleSection(title: "테스트 실행", systemImage: "play.rectangle", isExpanded: $isTestExecutionExpanded) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                        LabeledInput("테스트 케이스") {
+                            Picker("", selection: Binding(
+                                get: { state.selectedTestCaseID },
+                                set: { state.selectTestCase($0) }
+                            )) {
+                                Text("선택").tag(UUID?.none)
+                                ForEach(state.savedTestCases) { testCase in
+                                    Text(testCase.name).tag(Optional(testCase.id))
+                                }
                             }
+                            .labelsHidden()
                         }
-                        .frame(maxWidth: 420)
                         if let testCase = state.selectedTestCase {
                             Label(testCase.datasetName, systemImage: "tablecells")
                             Label(testCase.modelID, systemImage: "cpu")
                                 .foregroundStyle(.secondary)
                         }
-                        Spacer()
                     }
                     HStack {
-                        SecureField("\(state.selectedTestCase?.provider ?? state.provider.rawValue) API 키", text: $state.providerAPIKey)
-                        Button { pasteClipboard(into: $state.providerAPIKey) } label: {
-                            Image(systemName: "doc.on.clipboard")
+                        LabeledInput("API 키") {
+                            SecureField("", text: $state.providerAPIKey)
+                                .labelsHidden()
+                                .onSubmit { state.loadModels() }
                         }
-                        Text("실행 레코드")
-                        TextField("개수", value: $state.testRunLimit, format: .number)
-                            .frame(width: 80)
+                    }
+                    HStack(spacing: 12) {
+                        LabeledInput("실행 레코드") {
+                            TextField("", value: $state.testRunLimit, format: .number)
+                                .labelsHidden()
+                        }
                         Text("/ \(state.selectedTestCase.flatMap { selected in state.sourceDatasets.first { $0.id == selected.datasetID }?.rows.count } ?? 0)")
                             .foregroundStyle(.secondary)
                         Stepper("동시 실행 \(state.generationConcurrency)개", value: $state.generationConcurrency, in: 1...16)
-                            .frame(width: 180)
-                        Spacer()
                         if state.isTestRunning {
-                            ProgressView(value: Double(state.progress), total: Double(max(state.testRunLimit, 1)))
-                                .frame(width: 130)
                             Button(role: .destructive) { state.cancelTestRun() } label: {
                                 Label("취소", systemImage: "stop.fill")
                             }
@@ -791,14 +1135,10 @@ struct ContentView: View {
                         }
                     }
                 }
-                .padding(.top, 8)
-            } label: {
-                Label("테스트 실행", systemImage: "play.rectangle")
-                    .font(.headline)
             }
 
             Divider()
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Text("테스트 결과")
                     .font(.headline)
@@ -811,33 +1151,62 @@ struct ContentView: View {
                     Label("테스트 삭제", systemImage: "trash")
                 }
                 .disabled(state.selectedTestRun == nil || state.isTestRunning)
-                Spacer()
                 Text("총 \(state.testRuns.count)개")
                     .foregroundStyle(.secondary)
             }
 
-            if state.testRuns.isEmpty {
-                ContentUnavailableView("테스트 결과가 없습니다", systemImage: "play.rectangle", description: Text("저장된 테스트 케이스를 실행하세요."))
+            if state.testRuns.isEmpty && state.activeTestRun == nil {
+                ContentUnavailableView("테스트 결과가 없습니다", systemImage: "play.rectangle")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 HSplitView {
-                    List(selection: Binding(
-                        get: { state.selectedTestRunID },
-                        set: { state.selectTestRun($0) }
-                    )) {
-                        ForEach(state.testRuns) { run in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(run.name).fontWeight(.medium).lineLimit(1)
-                                Text(run.hasDeterministicCriteria
-                                     ? "\(run.completedCount)/\(run.requestedCount) · 통과 \(run.passedCount) · \(formatLatency(run.averageLatencyMilliseconds))"
-                                     : "\(run.completedCount)/\(run.requestedCount) · 정량 판정 없음 · \(formatLatency(run.averageLatencyMilliseconds))")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                Text("\(run.status.displayName) · \(run.completedAt.formatted(date: .numeric, time: .shortened))")
-                                    .font(.caption2)
-                                    .foregroundStyle(run.status == .completed ? .green : .orange)
+                    VStack(alignment: .leading, spacing: 8) {
+                        promptDatasetFilters(
+                            prompts: state.testRuns.map(\.promptName),
+                            datasets: state.testRuns.map(\.datasetName),
+                            promptSelection: $testRunPromptFilter,
+                            datasetSelection: $testRunDatasetFilter
+                        )
+                        List(selection: Binding(
+                            get: { state.selectedTestRunID },
+                            set: { state.selectTestRun($0) }
+                        )) {
+                            if let activeRun = state.activeTestRun {
+                                RunningProgressRow(
+                                    name: activeRun.name,
+                                    detail: activeRun.detail,
+                                    progress: state.progress,
+                                    total: activeRun.total,
+                                    systemImage: "play.fill"
+                                )
+                                .listRowBackground(Color.accentColor.opacity(0.08))
+                                .allowsHitTesting(false)
                             }
-                            .tag(Optional(run.id))
+                            ForEach(filteredTestRuns) { run in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(run.name).fontWeight(.medium).lineLimit(1)
+                                    Text(run.hasDeterministicCriteria
+                                         ? "\(run.completedCount)/\(run.requestedCount) · 통과 \(run.passedCount) · \(formatLatency(run.averageLatencyMilliseconds))"
+                                         : "\(run.completedCount)/\(run.requestedCount) · 정량 판정 없음 · \(formatLatency(run.averageLatencyMilliseconds))")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                    Text("\(run.status.displayName) · \(run.completedAt.formatted(date: .numeric, time: .shortened))")
+                                        .font(.caption2)
+                                        .foregroundStyle(run.status == .completed ? .green : .orange)
+                                }
+                                .tag(Optional(run.id))
+                                .contextMenu {
+                                    Button("Finder에서 보기") {
+                                        state.selectTestRun(run.id)
+                                        state.openSelectedTestRun()
+                                    }
+                                    Divider()
+                                    Button("삭제", role: .destructive) {
+                                        state.selectTestRun(run.id)
+                                        state.deleteSelectedTestRun()
+                                    }
+                                }
+                            }
                         }
                     }
                     .frame(minWidth: 270, idealWidth: 310, maxHeight: .infinity)
@@ -901,7 +1270,6 @@ struct ContentView: View {
                                 Text(option.rawValue).tag(option)
                             }
                         }
-                        .frame(width: 190)
                         Button { testResultSortDescending.toggle() } label: {
                             Image(systemName: testResultSortDescending ? "arrow.down" : "arrow.up")
                         }
@@ -911,8 +1279,6 @@ struct ContentView: View {
                                 Text(option.rawValue).tag(option)
                             }
                         }
-                        .frame(width: 170)
-                        Spacer()
                         Text("표시 \(displayedRows.count) / \(run.rows.count)")
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -936,42 +1302,27 @@ struct ContentView: View {
                 }
                 if displayedRows.isEmpty {
                     ContentUnavailableView("필터 조건에 맞는 테스트 결과가 없습니다", systemImage: "line.3.horizontal.decrease.circle")
+                        .frame(maxWidth: .infinity, minHeight: 160)
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(displayedRows) { row in
-                            let passed = testRunRowPassed(row)
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Spacer()
-                                    if row.error != nil {
-                                        Label("실패", systemImage: "xmark.circle.fill")
-                                            .foregroundStyle(.red)
-                                    } else if row.criterionResults.isEmpty {
-                                        Label("정량 판정 없음", systemImage: "minus.circle")
-                                            .foregroundStyle(.secondary)
-                                    } else {
-                                        Label(passed ? "통과" : "실패", systemImage: passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                            .foregroundStyle(passed ? .green : .red)
-                                    }
-                                }
-                                ForEach(row.criterionResults) { criterion in
-                                    HStack {
-                                        Text(criterion.name)
-                                            .fontWeight(.medium)
-                                        Text("기대값 \(criterion.expected)")
-                                        Text("결과값 \(criterion.actual)")
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Image(systemName: criterion.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                            .foregroundStyle(criterion.passed ? .green : .red)
-                                    }
-                                    .font(.caption)
-                                }
-                                if let error = row.error {
-                                    Text(error).font(.caption).foregroundStyle(.red)
-                                }
-                            }
+                            TestResultRowView(
+                                criterionResults: row.criterionResults,
+                                datasetValues: selectedDisplayValues(
+                                    row.displayDatasetValues,
+                                    allowedKeys: run.displayDatasetFields
+                                ),
+                                outputValues: selectedDisplayValues(
+                                    row.displayOutputValues,
+                                    allowedKeys: run.displayOutputPaths
+                                ),
+                                error: row.error,
+                                retryAction: row.error.map { _ in
+                                    { state.retryTestRunRow(row, in: run) }
+                                },
+                                isRetryDisabled: state.isTestRunning
+                            )
                             .padding(.vertical, 7)
                             Divider()
                         }
@@ -985,15 +1336,64 @@ struct ContentView: View {
                 ContentUnavailableView("테스트 결과를 선택하세요", systemImage: "sidebar.left")
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
+    }
+
+    private func selectedDisplayValues(
+        _ values: [String: String]?,
+        allowedKeys: [String]?
+    ) -> [String: String] {
+        guard let values, let allowedKeys else { return [:] }
+        return values.filter { allowedKeys.contains($0.key) }
+    }
+
+    private func previewDisplayDatasetValues(_ row: DatasetRow) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: state.testCaseDisplayDatasetFields.map { field in
+            (field, row.values[field] ?? "")
+        })
+    }
+
+    private func previewDisplayOutputValues(_ output: LLMOutputRecord) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: state.testCaseDisplayOutputPaths.map { path in
+            (path, JSONValueExtractor.value(at: path, in: output.output ?? "") ?? "")
+        })
+    }
+
+    private func selectedDatasetDisplayValues(
+        for row: DatasetRow?,
+        input: EvaluationInput
+    ) -> [String: String] {
+        guard let row else { return [:] }
+        return Dictionary(uniqueKeysWithValues: (input.displayDatasetFields ?? []).map { field in
+            (field, row.values[field] ?? "")
+        })
+    }
+
+    private func selectedOutputDisplayValues(
+        for row: DatasetRow?,
+        input: EvaluationInput
+    ) -> [String: String] {
+        guard let row else { return [:] }
+        return Dictionary(uniqueKeysWithValues: (input.displayOutputPaths ?? []).map { path in
+            (path, row.values["display.output.\(path)"] ?? "")
+        })
     }
 
     private func testCriterionConditionHeader(_ criterion: TestCriterionDefinition) -> String {
         let condition = criterion.withDefaultArrayAssertions()
+        if condition.valueType == .arrayObject {
+            if let matchField = condition.matchField?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !matchField.isEmpty,
+               let matchValue = condition.matchValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !matchValue.isEmpty {
+                return "\(condition.name): 배열 \(condition.outputPath)에서 \(matchField)의 값이 \(matchValue)인 요소를 검사합니다."
+            }
+            return "\(condition.name): 배열 \(condition.outputPath)의 요소를 검사합니다."
+        }
         switch condition.passRule {
         case .arrayObjectCondition:
-            return "\(condition.name): 만약 \(condition.outputPath)에 \(condition.matchField ?? "선택된 필드") 값이 \(condition.matchValue ?? "선택된 값")인 요소가 있다면"
+            return "\(condition.name): 배열 객체 조건"
         case .range:
             return "\(condition.name): output의 \(condition.outputPath) 값은 데이터셋의 \(condition.expectedMinField) 이상 \(condition.expectedMaxField) 이하여야 합니다."
         case .contains:
@@ -1007,67 +1407,70 @@ struct ContentView: View {
 
     private func testCriterionConditionBullets(_ criterion: TestCriterionDefinition) -> [String] {
         let condition = criterion.withDefaultArrayAssertions()
-        guard condition.passRule == .arrayObjectCondition else { return [] }
+        guard condition.valueType == .arrayObject else { return [] }
         return condition.arrayAssertions.map { assertion in
+            let detail: String
             switch assertion.kind {
             case .datasetValue:
-                return "데이터셋의 \(assertion.datasetField)는 값이 \(assertion.expectedValue)이어야 합니다."
+                detail = "데이터셋의 \(assertion.datasetField)는 값이 \(assertion.expectedValue)이어야 합니다."
             case .objectValueRange:
-                return "해당 요소의 \(assertion.objectField)는 \(assertion.minimumField) 이상 \(assertion.maximumField) 이하여야 합니다."
+                detail = "해당 요소의 \(assertion.objectField)는 \(assertion.minimumField) 이상 \(assertion.maximumField) 이하여야 합니다."
+            case .objectValueAllowedValues:
+                detail = "배열의 \(assertion.objectField) 값은 \(assertion.expectedValue) 중 하나여야 합니다."
+            case .arrayValueRequired:
+                detail = "배열의 \(assertion.objectField) 값에 \(assertion.expectedValue)가 하나 이상 있어야 합니다."
+            case .arrayValueForbidden:
+                detail = "배열의 \(assertion.objectField) 값에 \(assertion.expectedValue)가 포함되면 안 됩니다."
             }
+            let emptyArrayBehavior = assertion.allowEmptyArray ? " 빈 배열이면 통과합니다." : ""
+            return "\(assertion.name): \(detail)\(emptyArrayBehavior)"
         }
     }
 
     private var evaluationView: some View {
         GeometryReader { _ in
             VStack(alignment: .leading, spacing: 16) {
-            pageHeader(title: "평가", subtitle: "완료된 테스트 결과 파일을 불러와 선택한 로컬 Codex 모델로 평가합니다.")
-            DisclosureGroup(isExpanded: $isEvaluationExecutionExpanded) {
+            pageHeader(title: "평가")
+            CollapsibleSection(title: "평가 실행", systemImage: "checkmark.seal", isExpanded: $isEvaluationExecutionExpanded) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Picker("테스트 결과", selection: Binding(
-                        get: { state.selectedTestRunID },
-                        set: { state.selectTestRun($0) }
-                    )) {
-                        Text("완료된 테스트 결과 선택").tag(UUID?.none)
-                        ForEach(state.testRuns.filter { $0.status == .completed }) { run in
-                            Text(run.name).tag(Optional(run.id))
-                        }
-                    }
-                    .disabled(state.isEvaluating)
-                    HStack {
-                        Text("평가 모델")
-                        Picker("평가 모델", selection: $state.codexEvaluationModel) {
-                            ForEach(state.codexEvaluationModelOptions, id: \.self) { model in
-                                Text(model).tag(model)
+                    LabeledInput("테스트 결과") {
+                        Picker("", selection: Binding(
+                            get: { state.selectedTestRunID },
+                            set: { state.selectTestRun($0) }
+                        )) {
+                            Text("선택").tag(UUID?.none)
+                            ForEach(state.testRuns.filter { $0.status == .completed }) { run in
+                                Text(run.name).tag(Optional(run.id))
                             }
                         }
                         .labelsHidden()
-                        .frame(width: 220)
                         .disabled(state.isEvaluating)
-                        TextField("모델 ID 직접 입력", text: $state.codexEvaluationModel)
-                            .frame(width: 210)
-                            .disabled(state.isEvaluating)
-                        Spacer()
                     }
                     HStack {
-                        Text("평가 행 수")
-                        TextField("개수", value: $state.codexJudgeLimit, format: .number)
-                            .frame(width: 80)
+                        LabeledInput("평가 모델") {
+                            Picker("", selection: $state.codexEvaluationModel) {
+                                ForEach(state.codexEvaluationModelOptions, id: \.self) { model in
+                                    Text(model).tag(model)
+                                }
+                            }
+                            .labelsHidden()
                             .disabled(state.isEvaluating)
-                        Text("0은 output이 있는 모든 행")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack(spacing: 12) {
+                        LabeledInput("평가 행 수") {
+                            TextField("", value: $state.codexJudgeLimit, format: .number)
+                                .labelsHidden()
+                        }
+                            .disabled(state.isEvaluating)
                         Stepper("동시 실행 \(state.codexConcurrency)개", value: $state.codexConcurrency, in: 2...8)
-                            .frame(width: 180)
                             .disabled(state.isEvaluating)
-                        Spacer()
                     }
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("평가 프롬프트")
                                 .font(.headline)
-                            Spacer()
                             Button { state.recommendEvaluationPrompt() } label: {
                                 Label(
                                     state.isRecommendingEvaluationPrompt ? "추천 중" : "프롬프트 추천",
@@ -1088,26 +1491,15 @@ struct ContentView: View {
                         ScrollablePromptEditor(text: $state.evaluationPrompt)
                             .frame(height: 180)
                             .disabled(state.isRecommendingEvaluationPrompt || state.isEvaluating)
-                        Text("사용 변수: {{llm_input}}, {{original_prompt}}, {{dataset_values}}, {{test_criteria}}, {{model_output}}")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
                     Divider()
                     HStack {
-                        Text("Promptfoo API 키")
-                        SecureField("pf_...", text: $state.promptfooAPIKey)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 280)
-                            .disabled(state.isEvaluating || state.isSharingEvaluation)
-                        Button { pasteClipboard(into: $state.promptfooAPIKey) } label: {
-                            Image(systemName: "doc.on.clipboard")
+                        LabeledInput("Promptfoo API 키") {
+                            SecureField("", text: $state.promptfooAPIKey)
+                                .labelsHidden()
                         }
-                        .help("클립보드에서 Promptfoo API 키 붙여넣기")
-                        .disabled(state.isEvaluating || state.isSharingEvaluation)
-                        Text("현재 앱 실행 중에만 보관")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(state.isEvaluating || state.isSharingEvaluation)
                     }
                 }
                 HStack {
@@ -1119,17 +1511,6 @@ struct ContentView: View {
                         Label(state.isEvaluating ? "평가 중" : "평가 실행", systemImage: "checkmark.seal")
                     }
                     .disabled(state.evaluationBundleURL == nil || state.isEvaluating)
-                    if state.isEvaluating {
-                        ProgressView(
-                            value: Double(state.evaluationProgress),
-                            total: Double(max(state.evaluationTotal, 1))
-                        )
-                        .frame(width: 150)
-                        Text("\(state.evaluationProgress)/\(state.evaluationTotal)")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
                 }
                 if let run = state.selectedTestRun {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 7) {
@@ -1138,11 +1519,7 @@ struct ContentView: View {
                         GridRow { Text("테스트 모델").foregroundStyle(.secondary); Text(run.modelID) }
                         GridRow { Text("레코드").foregroundStyle(.secondary); Text("\(run.completedCount)개") }
                     }
-                    .padding(.top, 8)
-                }
-            } label: {
-                Label("평가 실행", systemImage: "checkmark.seal")
-                    .font(.headline)
+            }
             }
             Divider()
             evaluationResultsContent
@@ -1190,22 +1567,35 @@ struct ContentView: View {
                     Label("평가 삭제", systemImage: "trash")
                 }
                 .disabled(state.selectedEvaluationResult == nil)
-                Spacer()
                 Text("총 \(state.evaluationResults.count)개")
                     .foregroundStyle(.secondary)
             }
 
-            if state.evaluationResults.isEmpty {
-                ContentUnavailableView(
-                    "평가 결과가 없습니다",
-                    systemImage: "chart.bar.doc.horizontal",
-                    description: Text("완료된 테스트 결과를 선택해 평가를 실행하세요.")
-                )
+            if state.evaluationResults.isEmpty && state.activeEvaluationRun == nil {
+                ContentUnavailableView("평가 결과가 없습니다", systemImage: "chart.bar.doc.horizontal")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 HSplitView {
-                    List(selection: $state.selectedEvaluationResultID) {
-                        ForEach(state.evaluationResults) { result in
+                    VStack(alignment: .leading, spacing: 8) {
+                        promptDatasetFilters(
+                            prompts: state.evaluationResults.compactMap { $0.input.promptName },
+                            datasets: state.evaluationResults.compactMap { $0.input.sourceDatasetName ?? $0.input.datasetName },
+                            promptSelection: $evaluationPromptFilter,
+                            datasetSelection: $evaluationDatasetFilter
+                        )
+                        List(selection: $state.selectedEvaluationResultID) {
+                            if let activeRun = state.activeEvaluationRun {
+                                RunningProgressRow(
+                                    name: activeRun.name,
+                                    detail: activeRun.detail,
+                                    progress: state.evaluationProgress,
+                                    total: activeRun.total,
+                                    systemImage: "checkmark.seal"
+                                )
+                                .listRowBackground(Color.accentColor.opacity(0.08))
+                                .allowsHitTesting(false)
+                            }
+                            ForEach(filteredEvaluationResults) { result in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(result.input.testCaseName ?? result.input.promptName ?? result.input.datasetName ?? "평가 실행")
                                     .fontWeight(.medium)
@@ -1227,7 +1617,6 @@ struct ContentView: View {
                                     Image(systemName: result.isComplete ? "checkmark.circle.fill" : "clock")
                                     Text(result.isComplete ? "완료" : "미완료")
                                     Text(result.executionDate.formatted(date: .numeric, time: .shortened))
-                                    Spacer()
                                     Image(systemName: result.integrity.systemImage)
                                         .help(result.integrity.label)
                                 }
@@ -1235,6 +1624,28 @@ struct ContentView: View {
                                 .foregroundStyle(result.integrity == .invalid ? Color.red : (result.isComplete ? Color.green : Color.secondary))
                             }
                             .tag(Optional(result.id))
+                            .contextMenu {
+                                Button("Finder에서 보기") {
+                                    state.selectedEvaluationResultID = result.id
+                                    state.openSelectedEvaluationResult()
+                                }
+                                Menu("내보내기") {
+                                    Button("CSV") {
+                                        state.selectedEvaluationResultID = result.id
+                                        state.exportSelectedEvaluationData(format: .csv)
+                                    }
+                                    Button("JSON") {
+                                        state.selectedEvaluationResultID = result.id
+                                        state.exportSelectedEvaluationData(format: .json)
+                                    }
+                                }
+                                Divider()
+                                Button("삭제", role: .destructive) {
+                                    state.selectedEvaluationResultID = result.id
+                                    state.deleteSelectedEvaluationResult()
+                                }
+                            }
+                            }
                         }
                     }
                     .frame(minWidth: 260, idealWidth: 300, maxHeight: .infinity)
@@ -1254,14 +1665,13 @@ struct ContentView: View {
     private var evaluationResultDetail: some View {
         if let result = state.selectedEvaluationResult {
             VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .top) {
+                HStack {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(result.input.testCaseName ?? result.input.promptName ?? "이름 없는 테스트")
                             .font(.title3.weight(.semibold))
                         Text(result.input.sourceDatasetName ?? result.input.datasetName ?? "데이터셋 정보 없음")
                             .foregroundStyle(.secondary)
                     }
-                    Spacer()
                     Label(result.integrity.label, systemImage: result.integrity.systemImage)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(result.integrity == .invalid ? Color.red : Color.secondary)
@@ -1326,7 +1736,6 @@ struct ContentView: View {
                                         Text(option.rawValue).tag(option)
                                     }
                                 }
-                                .frame(width: 190)
                                 Button { judgementSortDescending.toggle() } label: {
                                     Image(systemName: judgementSortDescending ? "arrow.down" : "arrow.up")
                                 }
@@ -1336,8 +1745,6 @@ struct ContentView: View {
                                         Text(option.rawValue).tag(option)
                                     }
                                 }
-                                .frame(width: 170)
-                                Spacer()
                                 Text("표시 \(displayedJudgements.count) / \(result.judgements.count)")
                                     .font(.caption.monospacedDigit())
                                     .foregroundStyle(.secondary)
@@ -1367,6 +1774,7 @@ struct ContentView: View {
 
                         if displayedJudgements.isEmpty {
                             ContentUnavailableView("필터 조건에 맞는 판정이 없습니다", systemImage: "line.3.horizontal.decrease.circle")
+                                .frame(maxWidth: .infinity, minHeight: 160)
                         } else {
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 8) {
@@ -1374,12 +1782,13 @@ struct ContentView: View {
                                     let row = result.datasetRow(for: judgement)
                                     let title = row?.values["source_data"] ?? "데이터 행"
                                     let totalTokens = judgementTokenCount(judgement, row: row)
+                                    let datasetValues = selectedDatasetDisplayValues(for: row, input: result.input)
+                                    let outputValues = selectedOutputDisplayValues(for: row, input: result.input)
                                     VStack(alignment: .leading, spacing: 6) {
                                         HStack {
                                             Text(title)
                                                 .font(.caption.weight(.semibold))
                                                 .lineLimit(2)
-                                            Spacer()
                                             Label(formatTokens(totalTokens), systemImage: "number")
                                                 .help("소모 토큰 합계")
                                             Label(formatLatency(row?.latencyMilliseconds), systemImage: "timer")
@@ -1389,12 +1798,20 @@ struct ContentView: View {
                                             } else {
                                                 Label("오류", systemImage: "exclamationmark.triangle.fill")
                                                     .foregroundStyle(.red)
+                                                Button { state.retryEvaluationJudgement(judgement, in: result) } label: {
+                                                    Image(systemName: "arrow.clockwise")
+                                                }
+                                                .help("오류 행 다시 평가")
+                                                .disabled(state.isEvaluating)
                                             }
                                         }
+                                        SelectedResultValues(
+                                            datasetValues: datasetValues,
+                                            outputValues: outputValues
+                                        )
                                         if let judge = judgement.judge {
-                                            ForEach(judge.reasons, id: \.self) { reason in
-                                                Text(reason)
-                                                    .font(.caption)
+                                            if !judge.reasons.isEmpty {
+                                                CopyableDetailText(judge.reasons.joined(separator: "\n"), font: .caption)
                                                     .foregroundStyle(.secondary)
                                             }
                                             if let criteria = judge.criteria, !criteria.isEmpty {
@@ -1404,28 +1821,18 @@ struct ContentView: View {
                                                         Label(criterion.name, systemImage: criterion.pass ? "checkmark.circle" : "xmark.circle")
                                                             .font(.caption.weight(.semibold))
                                                             .foregroundStyle(criterion.pass ? .green : .red)
-                                                        Text("기대: \(criterion.expected)")
-                                                            .font(.caption2)
-                                                        Text("결과: \(criterion.observed)")
-                                                            .font(.caption2)
-                                                        Text(criterion.reason)
-                                                            .font(.caption)
+                                                        CopyableDetailText(
+                                                            "기대: \(criterion.expected)\n결과: \(criterion.observed)",
+                                                            font: .caption2
+                                                        )
+                                                        CopyableDetailText(criterion.reason, font: .caption)
                                                             .foregroundStyle(.secondary)
                                                     }
                                                     .padding(.vertical, 3)
                                                 }
-                                            } else if result.input.criteria?.isEmpty == true {
-                                                Text("정량 평가 기준 없이 원본 프롬프트와 전체 output을 평가했습니다.")
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                            } else {
-                                                Text("기대값과 결과값이 기록되지 않은 이전 평가 형식입니다.")
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
                                             }
                                         } else if let error = judgement.error {
-                                            Text(error)
-                                                .font(.caption.monospaced())
+                                            CopyableDetailText(error, font: .caption.monospaced())
                                                 .foregroundStyle(.red)
                                         }
                                     }
@@ -1438,11 +1845,7 @@ struct ContentView: View {
                         }
                     }
                 } else {
-                    ContentUnavailableView(
-                        "평가가 완료되지 않았습니다",
-                        systemImage: "clock.badge.exclamationmark",
-                        description: Text("비교 작업공간에서 이 평가 번들을 다시 실행하세요.")
-                    )
+                ContentUnavailableView("평가가 완료되지 않았습니다", systemImage: "clock.badge.exclamationmark")
                 }
 
                 Text(result.folderURL.path)
@@ -1456,7 +1859,7 @@ struct ContentView: View {
                 ContentUnavailableView("평가 결과를 선택하세요", systemImage: "sidebar.left")
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
     }
 
@@ -1483,11 +1886,9 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextField("최소", text: minimum)
-                .frame(width: 58)
             Text("~")
                 .foregroundStyle(.secondary)
             TextField("최대", text: maximum)
-                .frame(width: 58)
         }
     }
 
@@ -1709,13 +2110,9 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("프롬프트 비교 작업 공간")
-                    .font(.title2.weight(.semibold))
-                Text(state.status)
-                    .foregroundStyle(.secondary)
-            }
+        HStack {
+            Text("프롬프트 비교 작업 공간")
+                .font(.title2.weight(.semibold))
             Spacer()
             if state.isRunning || state.isEvaluating || state.isLoadingModels {
                 ProgressView()
@@ -1724,18 +2121,20 @@ struct ContentView: View {
         }
     }
 
-    private func pageHeader(title: String, subtitle: String) -> some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                Text(subtitle)
-                    .foregroundStyle(.secondary)
-                Text(state.status)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+    private func pageHeader(title: String) -> some View {
+        HStack {
+            Text(title)
+                .font(.title2.weight(.semibold))
             Spacer()
+        }
+    }
+
+    private func dismissNotificationAfterDelay() {
+        guard let notification = state.notification else { return }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            guard state.notification?.id == notification.id else { return }
+            withAnimation { state.notification = nil }
         }
     }
 
@@ -1796,13 +2195,7 @@ struct ContentView: View {
 
                 HStack {
                     SecureField("\(state.provider.rawValue) API 키", text: $state.providerAPIKey)
-                        .contextMenu {
-                            Button("붙여넣기") { pasteClipboard(into: $state.providerAPIKey) }
-                        }
-                    Button { pasteClipboard(into: $state.providerAPIKey) } label: {
-                        Image(systemName: "doc.on.clipboard")
-                    }
-                    .help("클립보드에서 API 키 붙여넣기")
+                        .onSubmit { state.loadModels() }
                     Button { state.loadModels() } label: {
                         Label("모델 불러오기", systemImage: "arrow.clockwise")
                     }
@@ -1816,9 +2209,6 @@ struct ContentView: View {
                         }
                     }
                 }
-                Text("API 키는 이 앱 세션 동안에만 메모리에 보관됩니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .padding(.top, 6)
         }
@@ -1830,9 +2220,6 @@ struct ContentView: View {
                 Text("실행 행 수")
                 TextField("0", value: $state.runLimit, format: .number)
                     .frame(width: 72)
-                Text(state.runLimit == 0 ? "0은 모든 행을 실행합니다" : "전체 실행 전에 작은 표본으로 확인하세요")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Stepper(
                     "LLM 동시 요청 \(state.generationConcurrency)개",
                     value: $state.generationConcurrency,
@@ -1857,10 +2244,6 @@ struct ContentView: View {
     private var resultsSection: some View {
         GroupBox("5. 생성된 LLM 실행 데이터셋") {
             VStack(alignment: .leading, spacing: 10) {
-                Text(state.isEvaluationDatasetSelected
-                     ? "\(state.completedCount) / \(state.rows.count)개 행에 모델 출력이 있습니다. 원본 데이터셋은 변경되지 않습니다."
-                     : "출력을 생성하면 원본과 분리된 LLM 실행 데이터셋이 새로 만들어집니다.")
-                    .foregroundStyle(.secondary)
                 if let dataset = state.selectedDataset, dataset.kind == .evaluation {
                     HStack(spacing: 16) {
                         Label(dataset.sourceDatasetName ?? "-", systemImage: "tablecells")
@@ -1879,8 +2262,6 @@ struct ContentView: View {
     private var evaluationSection: some View {
         GroupBox("6. Promptfoo + Codex 평가") {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Promptfoo로 출력 JSON을 검증하고, 로컬 인증된 Codex SDK로 제한된 정성 평가를 수행하는 Node 번들을 만듭니다.")
-                    .foregroundStyle(.secondary)
                 HStack {
                     Text("평가 모델")
                     Picker("평가 모델", selection: $state.codexEvaluationModel) {
@@ -1892,12 +2273,6 @@ struct ContentView: View {
                     .pickerStyle(.menu)
                         .frame(width: 220)
                         .disabled(state.isEvaluating)
-                    TextField("모델 ID 직접 입력", text: $state.codexEvaluationModel)
-                        .frame(width: 190)
-                        .disabled(state.isEvaluating)
-                    Text("선택한 모델 ID는 평가 로그에 기록됩니다.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                     Spacer()
                 }
                 HStack(spacing: 18) {
@@ -1936,27 +2311,459 @@ struct ContentView: View {
                     Label("평가 결과 보기", systemImage: "chart.bar.doc.horizontal")
                 }
                 .disabled(state.evaluationResults.isEmpty)
-                Text("평가 의존성은 공용 런타임에 한 번만 설치됩니다. Node, pnpm, 로컬 Codex 로그인이 필요합니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .padding(.top, 6)
         }
     }
 
-    private func pasteClipboard(into binding: Binding<String>) {
-        guard let value = NSPasteboard.general.string(forType: .string) else {
-            state.status = "클립보드에 붙여넣을 텍스트가 없습니다."
-            return
+}
+
+private struct TestRunCriterionGroup: Identifiable {
+    let id: UUID
+    let name: String
+    let isHierarchical: Bool
+    var results: [CriterionRunResult]
+}
+
+private struct TestResultRowView: View {
+    let criterionResults: [CriterionRunResult]
+    let datasetValues: [String: String]
+    let outputValues: [String: String]
+    let error: String?
+    let retryAction: (() -> Void)?
+    let isRetryDisabled: Bool
+
+    init(
+        criterionResults: [CriterionRunResult],
+        datasetValues: [String: String],
+        outputValues: [String: String],
+        error: String?,
+        retryAction: (() -> Void)? = nil,
+        isRetryDisabled: Bool = false
+    ) {
+        self.criterionResults = criterionResults
+        self.datasetValues = datasetValues
+        self.outputValues = outputValues
+        self.error = error
+        self.retryAction = retryAction
+        self.isRetryDisabled = isRetryDisabled
+    }
+
+    private var passed: Bool {
+        !criterionResults.isEmpty && criterionResults.allSatisfy(\.passed)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Spacer()
+                if error != nil {
+                    Label("실패", systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                    if let retryAction {
+                        Button(action: retryAction) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .help("오류 행 다시 실행")
+                        .disabled(isRetryDisabled)
+                    }
+                } else if criterionResults.isEmpty {
+                    Label("정량 판정 없음", systemImage: "minus.circle")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Label(passed ? "통과" : "실패", systemImage: passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(passed ? .green : .red)
+                }
+            }
+            SelectedResultValues(datasetValues: datasetValues, outputValues: outputValues)
+            ForEach(groupedCriteria) { group in
+                if group.isHierarchical {
+                    Text(group.name)
+                        .font(.caption.weight(.semibold))
+                    ForEach(group.results) { criterion in
+                        CriterionResultLine(criterion: criterion)
+                            .padding(.leading, 24)
+                    }
+                } else if let criterion = group.results.first {
+                    CriterionResultLine(criterion: criterion)
+                }
+            }
+            if let error {
+                CopyableDetailText(error, font: .caption)
+                    .foregroundStyle(.red)
+            }
         }
-        binding.wrappedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        state.status = "API 키를 클립보드에서 붙여넣었습니다."
+    }
+
+    private var groupedCriteria: [TestRunCriterionGroup] {
+        var groups: [TestRunCriterionGroup] = []
+        var indices: [UUID: Int] = [:]
+
+        for result in criterionResults {
+            let groupID = result.parentCriterionID ?? result.criterionID
+            if let index = indices[groupID] {
+                groups[index].results.append(result)
+            } else {
+                indices[groupID] = groups.count
+                groups.append(TestRunCriterionGroup(
+                    id: groupID,
+                    name: result.parentCriterionName ?? result.name,
+                    isHierarchical: result.parentCriterionName != nil,
+                    results: [result]
+                ))
+            }
+        }
+        return groups
+    }
+}
+
+private struct CriterionResultLine: View {
+    let criterion: CriterionRunResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(criterion.name)
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Image(systemName: criterion.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .foregroundStyle(criterion.passed ? .green : .red)
+            }
+            resultValue(label: "기대값", value: criterion.expected)
+            resultValue(label: "결과값", value: criterion.actual)
+        }
+    }
+
+    private func resultValue(label: String, value: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .leading)
+            CopyableDetailText(value, font: .caption)
+        }
+    }
+}
+
+private struct SelectedResultValues: View {
+    let datasetValues: [String: String]
+    let outputValues: [String: String]
+
+    private var arrayOutputGroups: [ArrayOutputDisplayGroup] {
+        var groupedValues: [String: [String: String]] = [:]
+
+        for (path, value) in outputValues {
+            guard let marker = path.range(of: "[]") else { continue }
+            let arrayPath = String(path[..<marker.lowerBound])
+            let fieldPath = String(path[marker.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard !arrayPath.isEmpty, !fieldPath.isEmpty else { continue }
+            groupedValues[arrayPath, default: [:]][fieldPath] = value
+        }
+
+        return groupedValues.keys.sorted().compactMap { arrayPath in
+            guard let fields = groupedValues[arrayPath] else { return nil }
+            let valuesByField = fields.mapValues(jsonArray)
+            let count = valuesByField.values.map(\.count).max() ?? 0
+            guard count > 0 else { return nil }
+
+            let elements = (0..<count).map { index in
+                Dictionary(uniqueKeysWithValues: fields.keys.sorted().map { field in
+                    let value = valuesByField[field]?[safe: index] ?? ""
+                    return (field, jsonDisplayValue(value))
+                })
+            }
+            return ArrayOutputDisplayGroup(path: arrayPath, elements: elements)
+        }
+    }
+
+    private var scalarOutputValues: [String: String] {
+        outputValues.filter { !$0.key.contains("[]") }
+    }
+
+    var body: some View {
+        if !datasetValues.isEmpty || !outputValues.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                if !datasetValues.isEmpty {
+                    valueGroup(title: "데이터셋 값", values: datasetValues)
+                }
+                if !outputValues.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("output 값")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        if !scalarOutputValues.isEmpty {
+                            valueGroup(values: scalarOutputValues)
+                        }
+                        ForEach(arrayOutputGroups) { group in
+                            arrayOutputGroup(group)
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    private func valueGroup(title: String? = nil, values: [String: String]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let title {
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(values.keys.sorted(), id: \.self) { key in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(key)
+                        .font(.caption.weight(.medium))
+                    CopyableDetailText(values[key] ?? "", font: .caption)
+                        .padding(.leading, 8)
+                }
+            }
+        }
+    }
+
+    private func arrayOutputGroup(_ group: ArrayOutputDisplayGroup) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(group.path)
+                .font(.caption.weight(.medium))
+            Text("[")
+                .font(.caption.monospaced())
+            ForEach(Array(group.elements.enumerated()), id: \.offset) { index, element in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("{")
+                        .font(.caption.monospaced())
+                    ForEach(element.keys.sorted(), id: \.self) { field in
+                        HStack(alignment: .top, spacing: 4) {
+                            Text("\(field):")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                            CopyableDetailText(element[field] ?? "", font: .caption)
+                        }
+                        .padding(.leading, 12)
+                    }
+                    Text(index == group.elements.indices.last ? "}" : "},")
+                        .font(.caption.monospaced())
+                }
+                .padding(.leading, 8)
+            }
+            Text("]")
+                .font(.caption.monospaced())
+        }
+    }
+
+    private func jsonArray(_ text: String) -> [Any] {
+        guard let data = text.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data),
+              let array = value as? [Any] else {
+            return []
+        }
+        return array
+    }
+
+    private func jsonDisplayValue(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject([value]),
+              let data = try? JSONSerialization.data(withJSONObject: [value]),
+              let text = String(data: data, encoding: .utf8) else {
+            return String(describing: value)
+        }
+        return String(text.dropFirst().dropLast())
+    }
+}
+
+private struct ArrayOutputDisplayGroup: Identifiable {
+    let path: String
+    let elements: [[String: String]]
+
+    var id: String { path }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
+private struct ToastMessage: Identifiable {
+    let id = UUID()
+    let message: String
+}
+
+private struct ToastView: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.caption)
+                .lineLimit(2)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("닫기")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
+        .frame(maxWidth: 420, alignment: .leading)
+    }
+}
+
+private struct CollapsibleSection<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @Binding var isExpanded: Bool
+    let content: () -> Content
+
+    init(
+        title: String,
+        systemImage: String,
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        _isExpanded = isExpanded
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Label(title, systemImage: systemImage)
+                        .font(.headline)
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content()
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+}
+
+private struct WorkflowSection<Content: View>: View {
+    let content: () -> Content
+
+    init(@ViewBuilder content: @escaping () -> Content) {
+        self.content = content
+    }
+
+    var body: some View {
+        content()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+private struct LabeledInput<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: () -> Content
+
+    init(_ title: String, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.content = content
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            content()
+        }
+    }
+}
+
+private struct RunningProgressRow: View {
+    let name: String
+    let detail: String
+    let progress: Int
+    let total: Int
+    let systemImage: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(name, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            ProgressView(value: Double(progress), total: Double(max(total, 1)))
+            Text("\(progress)/\(total)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct CopyableDetailText: View {
+    let text: String
+    let font: Font
+    @State private var isHovering = false
+
+    init(_ text: String, font: Font = .caption) {
+        self.text = text
+        self.font = font
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(text)
+                .font(font)
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
+            if isHovering {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("복사")
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
     }
 }
 
 private struct DatasetLibraryTable: View {
     let datasets: [SavedDataset]
     @Binding var selection: UUID?
+    let onExport: (SavedDataset) -> Void
+    let onDelete: (SavedDataset) -> Void
 
     var body: some View {
         Table(datasets, selection: $selection) {
@@ -1964,6 +2771,11 @@ private struct DatasetLibraryTable: View {
                 Text(dataset.name)
                     .fontWeight(.medium)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .contextMenu {
+                        Button("내보내기") { onExport(dataset) }
+                        Divider()
+                        Button("삭제", role: .destructive) { onDelete(dataset) }
+                    }
             }
             .width(min: 160, ideal: 240, max: 360)
             TableColumn("유형") { dataset in
@@ -2019,7 +2831,7 @@ private struct DatasetPreview: View {
                     .padding(.bottom, 2)
 
                     ForEach(visibleRows) { row in
-                        HStack(alignment: .top, spacing: 12) {
+                        HStack(spacing: 12) {
                             ForEach(headers, id: \.self) { header in
                                 Text(row.values[header] ?? "")
                                     .font(.caption)
@@ -2105,6 +2917,305 @@ private struct ResultsPreview: View {
             }
         }
         .frame(maxHeight: 260)
+    }
+}
+
+private enum PromptStructuredBlock {
+    case heading(level: Int, text: String)
+    case bullet(depth: Int, text: String)
+    case paragraph(String)
+    case code(String)
+    case divider
+}
+
+private struct PromptStructuredView: View {
+    let text: String
+
+    private var blocks: [PromptStructuredBlock] {
+        PromptStructuredParser.blocks(from: text)
+    }
+
+    var body: some View {
+        ScrollView {
+            if blocks.isEmpty {
+                ContentUnavailableView("표시할 프롬프트가 없습니다.", systemImage: "text.document")
+                    .frame(maxWidth: .infinity, minHeight: 360)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { item in
+                        blockView(item.element)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: PromptStructuredBlock) -> some View {
+        switch block {
+        case let .heading(level, value):
+            Text(value)
+                .font(headingFont(for: level))
+                .fontWeight(.semibold)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, level == 1 ? 6 : 2)
+        case let .bullet(depth, value):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text("•")
+                Text(value)
+                    .textSelection(.enabled)
+            }
+            .padding(.leading, CGFloat(depth) * 20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case let .paragraph(value):
+            Text(value)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case let .code(value):
+            Text(value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(.tertiary, in: RoundedRectangle(cornerRadius: 4))
+        case .divider:
+            Divider()
+        }
+    }
+
+    private func headingFont(for level: Int) -> Font {
+        switch level {
+        case 1: .title2
+        case 2: .title3
+        case 3: .headline
+        default: .subheadline
+        }
+    }
+}
+
+private struct OutputExampleFieldPicker: View {
+    let schema: PromptOutputSchema
+    @Binding var selection: [String]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 3) {
+                ForEach(schema.exampleNodes) { node in
+                    if node.isSelectable {
+                        Button {
+                            toggle(node.path)
+                        } label: {
+                            nodeRow(node, isSelected: selection.contains(node.path))
+                        }
+                        .buttonStyle(.plain)
+                        .help(node.path)
+                    } else {
+                        nodeRow(node, isSelected: false)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.vertical, 3)
+        }
+        .frame(minWidth: 280, maxWidth: .infinity, minHeight: 90, maxHeight: 150)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+    }
+
+    private func nodeRow(_ node: PromptOutputExampleNode, isSelected: Bool) -> some View {
+        HStack(spacing: 5) {
+            if node.isSelectable {
+                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            } else {
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+            }
+            Text(node.label)
+                .font(.caption.monospaced())
+            Text(": \(node.value)")
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, CGFloat(node.depth) * 16 + 6)
+        .padding(.vertical, 3)
+        .padding(.trailing, 6)
+        .background(isSelected ? Color.accentColor.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 4))
+        .contentShape(Rectangle())
+    }
+
+    private func toggle(_ path: String) {
+        if selection.contains(path) {
+            selection.removeAll { $0 == path }
+        } else {
+            selection.append(path)
+        }
+    }
+}
+
+private struct DatasetPreviewFieldPicker: View {
+    let headers: [String]
+    let rows: [DatasetRow]
+    @Binding var selection: [String]
+
+    var body: some View {
+        ScrollView([.horizontal, .vertical]) {
+            LazyVStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    ForEach(headers, id: \.self) { header in
+                        Text(header)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(selection.contains(header) ? Color.accentColor : Color.secondary)
+                            .frame(width: 150, alignment: .leading)
+                    }
+                }
+                ForEach(rows) { row in
+                    HStack(spacing: 6) {
+                        ForEach(headers, id: \.self) { header in
+                            datasetCell(row: row, header: header)
+                        }
+                    }
+                }
+            }
+            .padding(6)
+        }
+        .frame(minWidth: 280, maxWidth: .infinity, minHeight: 90, maxHeight: 150)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+    }
+
+    private func toggle(_ field: String) {
+        if selection.contains(field) {
+            selection.removeAll { $0 == field }
+        } else {
+            selection.append(field)
+        }
+    }
+
+    private func datasetCell(row: DatasetRow, header: String) -> some View {
+        let isSelected = selection.contains(header)
+        let value = row.values[header] ?? ""
+        return Button {
+            toggle(header)
+        } label: {
+            Text(value)
+                .font(.caption)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(width: 150, height: 34, alignment: .leading)
+                .padding(.horizontal, 5)
+                .background(
+                    isSelected ? Color.accentColor.opacity(0.14) : .clear,
+                    in: RoundedRectangle(cornerRadius: 4)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(header)
+    }
+}
+
+private enum PromptStructuredParser {
+    static func blocks(from text: String) -> [PromptStructuredBlock] {
+        var result: [PromptStructuredBlock] = []
+        var paragraphLines: [String] = []
+        var codeLines: [String] = []
+        var isInCodeBlock = false
+
+        func flushParagraph() {
+            let paragraph = paragraphLines
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            if !paragraph.isEmpty {
+                result.append(.paragraph(cleanInlineMarkdown(paragraph)))
+            }
+            paragraphLines = []
+        }
+
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("```") {
+                flushParagraph()
+                if isInCodeBlock {
+                    result.append(.code(codeLines.joined(separator: "\n")))
+                    codeLines = []
+                }
+                isInCodeBlock.toggle()
+                continue
+            }
+            if isInCodeBlock {
+                codeLines.append(line)
+                continue
+            }
+            if trimmed.isEmpty {
+                flushParagraph()
+                continue
+            }
+            if isDivider(trimmed) {
+                flushParagraph()
+                result.append(.divider)
+                continue
+            }
+            if let heading = heading(from: trimmed) {
+                flushParagraph()
+                result.append(.heading(level: heading.level, text: cleanInlineMarkdown(heading.text)))
+                continue
+            }
+            if let bullet = bullet(from: line) {
+                flushParagraph()
+                result.append(.bullet(depth: bullet.depth, text: cleanInlineMarkdown(bullet.text)))
+                continue
+            }
+            paragraphLines.append(line)
+        }
+
+        if isInCodeBlock {
+            result.append(.code(codeLines.joined(separator: "\n")))
+        }
+        flushParagraph()
+        return result
+    }
+
+    private static func heading(from value: String) -> (level: Int, text: String)? {
+        let hashes = value.prefix { $0 == "#" }.count
+        guard (1...6).contains(hashes), value.count > hashes else { return nil }
+        let start = value.index(value.startIndex, offsetBy: hashes)
+        guard value[start] == " " else { return nil }
+        let text = value[value.index(after: start)...].trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (hashes, text)
+    }
+
+    private static func bullet(from line: String) -> (depth: Int, text: String)? {
+        let indentation = line.prefix { $0 == " " || $0 == "\t" }.count
+        let content = line.dropFirst(indentation)
+        let prefixLength: Int
+        if content.hasPrefix("- ") || content.hasPrefix("* ") || content.hasPrefix("+ ") {
+            prefixLength = 2
+        } else {
+            let digits = content.prefix { $0.isWholeNumber }
+            guard !digits.isEmpty,
+                  content.dropFirst(digits.count).hasPrefix(". ") else {
+                return nil
+            }
+            prefixLength = digits.count + 2
+        }
+        let text = content.dropFirst(prefixLength).trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        return (indentation / 2, text)
+    }
+
+    private static func isDivider(_ value: String) -> Bool {
+        value.count >= 3 && Set(value).isSubset(of: Set("-*_"))
+    }
+
+    private static func cleanInlineMarkdown(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "__", with: "")
+            .replacingOccurrences(of: "`", with: "")
     }
 }
 

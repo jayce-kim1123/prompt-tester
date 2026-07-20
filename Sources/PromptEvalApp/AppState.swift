@@ -21,6 +21,11 @@ private struct LLMGenerationResult: Sendable {
     let outputTokens: Int?
 }
 
+struct AppNotification: Identifiable {
+    let id = UUID()
+    let message: String
+}
+
 private func executeGenerationJob(
     _ job: LLMGenerationJob,
     provider: ProviderKind,
@@ -59,6 +64,13 @@ private func executeGenerationJob(
             outputTokens: nil
         )
     }
+}
+
+struct ActiveRunProgress: Identifiable {
+    let id: UUID
+    let name: String
+    let detail: String
+    let total: Int
 }
 
 @MainActor
@@ -148,12 +160,17 @@ final class AppState: ObservableObject {
     @Published var evaluationSummary: EvaluationRunSummary?
     @Published var evaluationResults: [EvaluationResultRecord] = []
     @Published var selectedEvaluationResultID: String?
+    private var evaluationRetryRowID: String?
     @Published var savedTestCases: [SavedTestCase] = []
     @Published var selectedTestCaseID: UUID?
     @Published var testCaseName = "새 테스트 케이스"
     @Published var testCaseCriteria: [TestCriterionDefinition] = []
+    @Published var testCaseDisplayDatasetFields: [String] = []
+    @Published var testCaseDisplayOutputPaths: [String] = []
     @Published var sampleOutput: LLMOutputRecord?
     @Published var criteriaPreviewOutputs: [LLMOutputRecord] = []
+    @Published private(set) var criteriaPreviewCriteria: [TestCriterionDefinition] = []
+    @Published private(set) var criteriaPreviewResults: [UUID: [CriterionRunResult]] = [:]
     @Published var isPreviewingTestCase = false
     @Published var isRunningCriteriaPreview = false
     @Published var criteriaPreviewProgress = 0
@@ -162,11 +179,20 @@ final class AppState: ObservableObject {
     @Published var selectedTestRunID: UUID?
     @Published var testRunLimit = 0
     @Published var isTestRunning = false
+    @Published var activeTestRun: ActiveRunProgress?
+    @Published var activeEvaluationRun: ActiveRunProgress?
     @Published var alertMessage: String?
+    @Published var notification: AppNotification?
 
     private var activeTestRunTask: Task<Void, Never>?
 
+    func notify(_ message: String) {
+        notification = AppNotification(message: message)
+    }
+
     var promptVariables: [String] { PromptTemplate.variables(in: promptText) }
+    var promptOutputSchema: PromptOutputSchema? { PromptOutputSchema.extract(from: promptText) }
+    var promptOutputSchemaPaths: [String] { promptOutputSchema?.paths ?? [] }
     var missingVariables: [String] { promptVariables.filter { !headers.contains($0) } }
     var completedCount: Int { rows.filter { $0.output != nil }.count }
     var selectedModelName: String { models.first(where: { $0.id == selectedModelID })?.name ?? selectedModelID }
@@ -195,8 +221,7 @@ final class AppState: ObservableObject {
     }
 
     func arrayObjectFields(at path: String) -> [String] {
-        guard let output = sampleOutput?.output else { return [] }
-        return JSONValueExtractor.objectFields(atArrayPath: path, in: output)
+        promptOutputSchema?.objectFields(atArrayPath: path) ?? []
     }
 
     func arrayObjectValues(at path: String, field: String) -> [String] {
@@ -293,13 +318,13 @@ final class AppState: ObservableObject {
             let content = try String(contentsOf: url, encoding: .utf8)
             registerPrompt(name: url.deletingPathExtension().lastPathComponent, content: content)
             status = "프롬프트를 불러왔습니다: \(url.lastPathComponent)"
+            notify(status)
         } catch {
             status = error.localizedDescription
         }
     }
 
     func newPrompt() {
-        saveCurrentPrompt(silent: true)
         selectedPromptID = nil
         promptName = "새 프롬프트"
         promptText = ""
@@ -313,7 +338,6 @@ final class AppState: ObservableObject {
         }
         guard let id else { return }
         guard id != selectedPromptID else { return }
-        saveCurrentPrompt(silent: true)
         selectedPromptID = id
         guard let prompt = savedPrompts.first(where: { $0.id == id }) else { return }
         promptName = prompt.name
@@ -337,7 +361,25 @@ final class AppState: ObservableObject {
             selectedPromptID = prompt.id
         }
         persistLibrary()
-        if !silent { status = "프롬프트를 저장했습니다: \(name)" }
+        if !silent {
+            status = "프롬프트를 저장했습니다: \(name)"
+            notify(status)
+        }
+    }
+
+    func duplicateSelectedPrompt() {
+        guard let id = selectedPromptID,
+              let prompt = savedPrompts.first(where: { $0.id == id }) else {
+            return
+        }
+        let copy = SavedPrompt(name: "\(prompt.name)_copy", content: prompt.content)
+        savedPrompts.insert(copy, at: 0)
+        selectedPromptID = copy.id
+        promptName = copy.name
+        promptText = copy.content
+        persistLibrary()
+        status = "프롬프트를 복제했습니다: \(copy.name)"
+        notify(status)
     }
 
     func deleteSelectedPrompt() {
@@ -348,6 +390,7 @@ final class AppState: ObservableObject {
         promptText = ""
         persistLibrary()
         status = "선택한 프롬프트를 라이브러리에서 삭제했습니다."
+        notify(status)
     }
 
     func chooseDataset() {
@@ -384,6 +427,7 @@ final class AppState: ObservableObject {
 
         if failures.isEmpty {
             status = "데이터셋 \(importedCount)개를 가져왔습니다."
+            notify(status)
         } else {
             let summary = "성공 \(importedCount)개, 실패 \(failures.count)개\n\n\(failures.joined(separator: "\n"))"
             status = "일부 데이터셋을 가져오지 못했습니다."
@@ -431,6 +475,7 @@ final class AppState: ObservableObject {
         rows = []
         persistLibrary()
         status = "선택한 데이터셋을 라이브러리에서 삭제했습니다."
+        notify(status)
     }
 
     func loadSpreadsheet() {
@@ -447,6 +492,7 @@ final class AppState: ObservableObject {
                     apiKey: googleAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
                 applyDataset(name: "Google Sheet \(spreadsheetID)", headers: dataset.headers, rows: dataset.rows, fileExtension: "gsheet")
+                notify(status)
             } catch {
                 status = error.localizedDescription
             }
@@ -475,8 +521,12 @@ final class AppState: ObservableObject {
         selectedTestCaseID = nil
         testCaseName = "새 테스트 케이스"
         testCaseCriteria = []
+        testCaseDisplayDatasetFields = []
+        testCaseDisplayOutputPaths = []
         sampleOutput = nil
         criteriaPreviewOutputs = []
+        criteriaPreviewCriteria = []
+        criteriaPreviewResults = [:]
         status = "프롬프트와 원본 데이터셋을 선택해 테스트 케이스를 만드세요."
     }
 
@@ -485,6 +535,9 @@ final class AppState: ObservableObject {
         selectedTestCaseID = id
         testCaseName = testCase.name
         testCaseCriteria = testCase.criteria.map { $0.withDefaultArrayAssertions() }
+        testCaseDisplayDatasetFields = testCase.displayDatasetFields ?? []
+        testCaseDisplayOutputPaths = testCase.displayOutputPaths ?? []
+        criteriaPreviewCriteria = testCaseCriteria
         codexEvaluationModel = testCase.recommendationModel
         provider = ProviderKind(rawValue: testCase.provider) ?? .gemini
         selectedModelID = testCase.modelID
@@ -512,6 +565,7 @@ final class AppState: ObservableObject {
         criteriaPreviewOutputs = (testCase.samplePreviewOutputIDs ?? []).compactMap {
             try? LLMOutputStore.load(id: $0)
         }
+        rebuildCriteriaPreviewResults()
         status = "테스트 케이스를 불러왔습니다: \(testCase.name)"
     }
 
@@ -543,6 +597,8 @@ final class AppState: ObservableObject {
             savedTestCases[index].modelID = selectedModelID
             savedTestCases[index].recommendationModel = codexEvaluationModel
             savedTestCases[index].criteria = testCaseCriteria
+            savedTestCases[index].displayDatasetFields = testCaseDisplayDatasetFields
+            savedTestCases[index].displayOutputPaths = testCaseDisplayOutputPaths
             savedTestCases[index].sampleRowID = rows.first?.id
             savedTestCases[index].sampleOutputID = sampleOutput?.id
             savedTestCases[index].samplePreviewOutputIDs = criteriaPreviewOutputs.isEmpty
@@ -561,6 +617,8 @@ final class AppState: ObservableObject {
                 modelID: selectedModelID,
                 recommendationModel: codexEvaluationModel,
                 criteria: testCaseCriteria,
+                displayDatasetFields: testCaseDisplayDatasetFields,
+                displayOutputPaths: testCaseDisplayOutputPaths,
                 sampleRowID: rows.first?.id,
                 sampleOutputID: sampleOutput?.id,
                 samplePreviewOutputIDs: criteriaPreviewOutputs.isEmpty ? nil : criteriaPreviewOutputs.map(\.id)
@@ -570,6 +628,7 @@ final class AppState: ObservableObject {
         }
         persistTestCases()
         status = "테스트 케이스를 저장했습니다: \(name)"
+        notify(status)
     }
 
     func deleteSelectedTestCase() {
@@ -578,6 +637,37 @@ final class AppState: ObservableObject {
         persistTestCases()
         newTestCase()
         status = "테스트 케이스를 삭제했습니다."
+        notify(status)
+    }
+
+    func duplicateSelectedTestCase() {
+        guard !isTestRunning,
+              let id = selectedTestCaseID,
+              let testCase = savedTestCases.first(where: { $0.id == id }) else {
+            return
+        }
+        let copy = SavedTestCase(
+            name: "\(testCase.name)_copy",
+            promptID: testCase.promptID,
+            promptName: testCase.promptName,
+            prompt: testCase.prompt,
+            datasetID: testCase.datasetID,
+            datasetName: testCase.datasetName,
+            provider: testCase.provider,
+            modelID: testCase.modelID,
+            recommendationModel: testCase.recommendationModel,
+            criteria: testCase.criteria,
+            displayDatasetFields: testCase.displayDatasetFields,
+            displayOutputPaths: testCase.displayOutputPaths,
+            sampleRowID: testCase.sampleRowID,
+            sampleOutputID: testCase.sampleOutputID,
+            samplePreviewOutputIDs: testCase.samplePreviewOutputIDs
+        )
+        savedTestCases.insert(copy, at: 0)
+        persistTestCases()
+        selectTestCase(copy.id)
+        status = "테스트 케이스를 복제했습니다: \(copy.name)"
+        notify(status)
     }
 
     func runTestCasePreview() {
@@ -620,14 +710,18 @@ final class AppState: ObservableObject {
                 )
                 try LLMOutputStore.save(output)
                 sampleOutput = output
-                if let text = output.output {
+                if output.output != nil {
+                    guard !promptOutputSchemaPaths.isEmpty else {
+                        status = "1행 output을 저장했지만 프롬프트에서 JSON output 스키마를 찾지 못했습니다."
+                        return
+                    }
                     testCaseCriteria = TestResultEvaluator.recommendCriteria(
                         headers: headers,
                         variableFields: promptVariables,
                         sampleValues: row.values,
-                        output: text
+                        outputPaths: promptOutputSchemaPaths
                     )
-                    status = "1행 출력을 별도 저장하고 평가 기준 추천값을 만들었습니다."
+                    status = "1행 output을 별도 저장하고 프롬프트의 output 스키마로 평가 기준 추천값을 만들었습니다."
                 } else {
                     status = "미리 실행 실패: \(output.error ?? "알 수 없는 오류")"
                 }
@@ -667,6 +761,7 @@ final class AppState: ObservableObject {
         let runProvider = provider
         let modelID = selectedModelID
         let concurrency = min(max(generationConcurrency, 1), previewRows.count)
+        commitCriteriaPreviewCriteria()
 
         Task {
             isRunningCriteriaPreview = true
@@ -734,9 +829,10 @@ final class AppState: ObservableObject {
                     try LLMOutputStore.save(record)
                 }
                 criteriaPreviewOutputs = ordered
+                rebuildCriteriaPreviewResults()
                 let failures = ordered.filter { $0.error != nil }.count
                 status = failures == 0
-                    ? "5행 조건 미리보기를 완료했습니다. 조건을 수정하면 결과가 즉시 갱신됩니다."
+                    ? "5행 조건 미리보기를 완료했습니다. 조건 입력을 마치고 포커스를 벗어나면 결과가 갱신됩니다."
                     : "5행 중 \(failures)행의 미리 실행이 실패했습니다."
             } catch {
                 status = "조건 미리보기 저장 실패: \(error.localizedDescription)"
@@ -745,19 +841,33 @@ final class AppState: ObservableObject {
     }
 
     func criterionResults(for preview: TestCaseCriteriaPreview) -> [CriterionRunResult] {
-        guard let output = preview.output.output else { return [] }
-        return TestResultEvaluator.evaluate(
-            criteria: testCaseCriteria,
-            values: preview.row.values,
-            output: output
-        )
+        criteriaPreviewResults[preview.row.id] ?? []
+    }
+
+    func commitCriteriaPreviewCriteria() {
+        criteriaPreviewCriteria = testCaseCriteria
+        rebuildCriteriaPreviewResults()
+    }
+
+    private func rebuildCriteriaPreviewResults() {
+        let criteria = criteriaPreviewCriteria
+        criteriaPreviewResults = Dictionary(uniqueKeysWithValues: criteriaPreviewOutputs.compactMap { output in
+            guard let row = rows.first(where: { $0.id == output.rowID }),
+                  let text = output.output else {
+                return nil
+            }
+            return (
+                output.rowID,
+                TestResultEvaluator.evaluate(criteria: criteria, values: row.values, output: text)
+            )
+        })
     }
 
     func recommendCriteriaWithCodex() {
         guard !isRecommendingCriteria,
               let row = rows.first,
-              let output = sampleOutput?.output else {
-            status = "먼저 1행 테스트를 실행해 output을 생성하세요."
+              let outputSchema = promptOutputSchema else {
+            status = "프롬프트에 유효한 JSON output 스키마를 포함하세요."
             return
         }
         let model = codexEvaluationModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -774,7 +884,7 @@ final class AppState: ObservableObject {
                     model: model,
                     variableFields: variableFields,
                     rowValues: row.values,
-                    output: output
+                    outputSchema: outputSchema.json
                 )
                 guard !recommended.isEmpty else {
                     status = "Codex가 추천 가능한 평가 기준을 찾지 못했습니다."
@@ -794,7 +904,7 @@ final class AppState: ObservableObject {
             expectedField: testCaseExpectedFields.first ?? "",
             expectedMinField: "",
             expectedMaxField: "",
-            outputPath: sampleOutputPaths.first ?? "",
+            outputPath: promptOutputSchemaPaths.first ?? "",
             valueType: .text,
             passRule: .exact
         ))
@@ -819,6 +929,21 @@ final class AppState: ObservableObject {
                 objectField: objectField,
                 minimumField: minimumField,
                 maximumField: maximumField
+            ))
+        case .objectValueAllowedValues:
+            let objectField = arrayObjectFields(at: testCaseCriteria[index].outputPath).first ?? ""
+            testCaseCriteria[index].arrayAssertions.append(.objectValueAllowedValues(
+                objectField: objectField
+            ))
+        case .arrayValueRequired:
+            let objectField = arrayObjectFields(at: testCaseCriteria[index].outputPath).first ?? ""
+            testCaseCriteria[index].arrayAssertions.append(.arrayValueRequired(
+                objectField: objectField
+            ))
+        case .arrayValueForbidden:
+            let objectField = arrayObjectFields(at: testCaseCriteria[index].outputPath).first ?? ""
+            testCaseCriteria[index].arrayAssertions.append(.arrayValueForbidden(
+                objectField: objectField
             ))
         }
     }
@@ -846,13 +971,141 @@ final class AppState: ObservableObject {
             return
         }
         let count = min(max(testRunLimit, 1), dataset.rows.count)
-        activeTestRunTask = Task { await executeTestRun(testCase: testCase, dataset: dataset, count: count) }
+        let startedAt = Date()
+        let runID = UUID()
+        activeTestRun = ActiveRunProgress(
+            id: runID,
+            name: testRunName(testCase.name, date: startedAt),
+            detail: "\(testCase.datasetName) · \(testCase.modelID)",
+            total: count
+        )
+        isTestRunning = true
+        progress = 0
+        activeTestRunTask = Task {
+            await executeTestRun(
+                testCase: testCase,
+                dataset: dataset,
+                count: count,
+                runID: runID,
+                startedAt: startedAt
+            )
+        }
     }
 
     func cancelTestRun() {
         guard isTestRunning else { return }
         activeTestRunTask?.cancel()
         status = "테스트 취소를 요청했습니다. 완료된 행까지 결과 파일로 저장합니다."
+    }
+
+    func retryTestRunRow(_ resultRow: TestRunRowResult, in run: SavedTestRun) {
+        guard !isTestRunning, resultRow.error != nil else { return }
+        guard !providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "\(run.provider) API 키를 입력하세요."
+            return
+        }
+        guard let sourceDataset = savedDatasets.first(where: { $0.id == run.datasetID }),
+              let sourceRow = sourceDataset.rows.first(where: { $0.id == resultRow.rowID }) else {
+            status = "오류 행을 재실행할 원본 데이터셋 행을 찾을 수 없습니다."
+            return
+        }
+
+        let retryID = UUID()
+        activeTestRun = ActiveRunProgress(
+            id: retryID,
+            name: "\(run.testCaseName) 오류 재실행",
+            detail: "\(run.datasetName) · \(run.modelID)",
+            total: 1
+        )
+        isTestRunning = true
+        progress = 0
+        activeTestRunTask = Task {
+            defer {
+                isTestRunning = false
+                activeTestRun = nil
+                activeTestRunTask = nil
+            }
+            do {
+                let renderedInput = try PromptTemplate.render(run.prompt, values: sourceRow.values)
+                let generation = await executeGenerationJob(
+                    LLMGenerationJob(index: 0, rowID: sourceRow.id, llmInput: renderedInput),
+                    provider: ProviderKind(rawValue: run.provider) ?? .gemini,
+                    apiKey: providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    modelID: run.modelID
+                )
+                let outputRecord = LLMOutputRecord(
+                    rowID: sourceRow.id,
+                    renderedInput: generation.llmInput,
+                    output: generation.output,
+                    error: generation.error,
+                    provider: run.provider,
+                    modelID: run.modelID,
+                    latencyMilliseconds: generation.latencyMilliseconds,
+                    inputTokens: generation.inputTokens,
+                    outputTokens: generation.outputTokens
+                )
+                let criteriaResults = generation.output.map {
+                    TestResultEvaluator.evaluate(criteria: run.criteria, values: sourceRow.values, output: $0)
+                } ?? []
+                let variableFields = PromptTemplate.variables(in: run.prompt)
+                let updatedRow = TestRunRowResult(
+                    id: outputRecord.id,
+                    rowID: sourceRow.id,
+                    variables: dictionary(sourceRow.values, keys: variableFields),
+                    expectedValues: dictionaryExcluding(sourceRow.values, keys: variableFields),
+                    displayDatasetValues: dictionary(sourceRow.values, keys: run.displayDatasetFields ?? []),
+                    displayOutputValues: outputDisplayValues(generation.output, paths: run.displayOutputPaths ?? []),
+                    criterionResults: criteriaResults,
+                    latencyMilliseconds: generation.latencyMilliseconds,
+                    inputTokens: generation.inputTokens,
+                    outputTokens: generation.outputTokens,
+                    modelID: run.modelID,
+                    llmOutput: generation.output,
+                    error: generation.error
+                )
+                var updatedRows = run.rows.filter { $0.rowID != sourceRow.id }
+                updatedRows.append(updatedRow)
+                updatedRows.sort { left, right in
+                    let leftIndex = sourceDataset.rows.firstIndex { $0.id == left.rowID } ?? .max
+                    let rightIndex = sourceDataset.rows.firstIndex { $0.id == right.rowID } ?? .max
+                    return leftIndex < rightIndex
+                }
+                let updatedRun = SavedTestRun(
+                    id: run.id,
+                    name: run.name,
+                    testCaseID: run.testCaseID,
+                    testCaseName: run.testCaseName,
+                    datasetID: run.datasetID,
+                    datasetName: run.datasetName,
+                    promptID: run.promptID,
+                    promptName: run.promptName,
+                    prompt: run.prompt,
+                    provider: run.provider,
+                    modelID: run.modelID,
+                    criteria: run.criteria,
+                    displayDatasetFields: run.displayDatasetFields,
+                    displayOutputPaths: run.displayOutputPaths,
+                    requestedCount: run.requestedCount,
+                    status: .completed,
+                    startedAt: run.startedAt,
+                    completedAt: Date(),
+                    rows: updatedRows
+                )
+                var updatedOutputs = try TestRunStore.loadOutputs(for: run.id)
+                updatedOutputs.removeAll { $0.rowID == sourceRow.id }
+                updatedOutputs.append(outputRecord)
+                try TestRunStore.save(updatedRun, outputs: updatedOutputs)
+                testRuns = try TestRunStore.loadAll()
+                selectedTestRunID = run.id
+                progress = 1
+                status = generation.error == nil
+                    ? "오류 테스트 행을 재실행해 기존 결과에 반영했습니다."
+                    : "오류 테스트 행 재실행이 다시 실패했습니다."
+                notify(status)
+            } catch {
+                status = "오류 테스트 행 재실행 실패: \(error.localizedDescription)"
+            }
+        }
     }
 
     func refreshTestRuns() {
@@ -911,6 +1164,7 @@ final class AppState: ObservableObject {
             selectedTestRunID = nil
             refreshTestRuns()
             status = "테스트 결과를 삭제했습니다: \(run.name)"
+            notify(status)
         } catch {
             status = "테스트 결과를 삭제하지 못했습니다: \(error.localizedDescription)"
         }
@@ -1064,11 +1318,12 @@ final class AppState: ObservableObject {
             do {
                 try LibraryStore.save(SavedLibrary(prompts: savedPrompts, datasets: savedDatasets))
                 try GenerationCheckpointStore.remove(datasetID: evaluationDataset.id)
-                if let checkpointError {
-                    status = "출력 생성을 완료했습니다. 일부 증분 저장 경고: \(checkpointError)"
-                } else {
-                    status = "원본을 변경하지 않고 LLM 실행 데이터셋 \(datasetName)에 \(rows.count)건의 출력을 생성했습니다."
-                }
+            if let checkpointError {
+                status = "출력 생성을 완료했습니다. 일부 증분 저장 경고: \(checkpointError)"
+            } else {
+                status = "원본을 변경하지 않고 LLM 실행 데이터셋 \(datasetName)에 \(rows.count)건의 출력을 생성했습니다."
+            }
+            notify(status)
             } catch {
                 status = "출력은 생성했지만 최종 저장에 실패했습니다: \(error.localizedDescription)"
             }
@@ -1123,6 +1378,9 @@ final class AppState: ObservableObject {
             }
             let evaluationRows = run.rows.filter { $0.llmOutput != nil }.map { row in
                 var values = row.variables.merging(row.expectedValues) { _, expected in expected }
+                for (path, value) in row.displayOutputValues ?? [:] {
+                    values["display.output.\(path)"] = value
+                }
                 for result in row.criterionResults {
                     let prefix = "criterion.\(result.name)"
                     values["\(prefix).expected"] = result.expected
@@ -1156,7 +1414,9 @@ final class AppState: ObservableObject {
                 sourceDatasetName: run.datasetName,
                 promptName: run.promptName,
                 testCaseName: run.testCaseName,
-                criteria: run.criteria
+                criteria: run.criteria,
+                displayDatasetFields: run.displayDatasetFields,
+                displayOutputPaths: run.displayOutputPaths
             ))
             evaluationSummary = nil
             evaluationProgress = 0
@@ -1164,6 +1424,7 @@ final class AppState: ObservableObject {
             selectedEvaluationResultID = evaluationBundleURL?.lastPathComponent
             refreshEvaluationResults(silent: true)
             status = "Promptfoo + Codex 평가 번들을 만들었습니다."
+            notify(status)
         } catch {
             status = error.localizedDescription
         }
@@ -1172,6 +1433,7 @@ final class AppState: ObservableObject {
     func resetEvaluationPrompt() {
         evaluationPrompt = Self.defaultEvaluationPrompt
         status = "기본 평가 프롬프트로 되돌렸습니다."
+        notify(status)
     }
 
     func recommendEvaluationPrompt() {
@@ -1197,6 +1459,7 @@ final class AppState: ObservableObject {
                     criteria: run.criteria
                 )
                 status = "\(model)로 평가 프롬프트를 추천했습니다."
+                notify(status)
             } catch {
                 status = "평가 프롬프트 추천 실패: \(error.localizedDescription)"
             }
@@ -1208,24 +1471,33 @@ final class AppState: ObservableObject {
             status = "평가 번들을 먼저 만드세요."
             return
         }
+        let retryRowID = evaluationRetryRowID
         let evaluationModel = codexEvaluationModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !evaluationModel.isEmpty else {
             status = "평가에 사용할 Codex 모델을 입력하세요."
             return
         }
-        guard !FileManager.default.fileExists(
+        let hasCompletedLog = FileManager.default.fileExists(
             atPath: evaluationBundleURL.appendingPathComponent("results/evaluation-log.json").path
-        ) else {
+        )
+        guard !hasCompletedLog || retryRowID != nil else {
             status = "완료된 평가 로그는 수정할 수 없습니다. 새 평가 번들을 만들어 실행하세요."
             return
         }
         Task {
             do {
+                defer { evaluationRetryRowID = nil }
                 isEvaluating = true
                 evaluationProgress = 0
                 let inputURL = evaluationBundleURL.appendingPathComponent("eval-input.json")
                 let input = try JSONDecoder().decode(EvaluationInput.self, from: Data(contentsOf: inputURL))
-                evaluationTotal = minEvaluationCount(totalRows: input.rows.count)
+                evaluationTotal = retryRowID == nil ? minEvaluationCount(totalRows: input.rows.count) : 1
+                activeEvaluationRun = ActiveRunProgress(
+                    id: UUID(),
+                    name: input.testCaseName ?? input.promptName ?? input.datasetName ?? "평가 실행",
+                    detail: "\(input.sourceDatasetName ?? input.datasetName ?? "데이터셋 정보 없음") · \(evaluationModel)",
+                    total: evaluationTotal
+                )
                 let bundleNodeModules = evaluationBundleURL.appendingPathComponent("node_modules", isDirectory: true)
                 if !FileManager.default.fileExists(atPath: bundleNodeModules.path) {
                     let runtime = try EvaluationBundle.prepareSharedRuntime()
@@ -1241,24 +1513,30 @@ final class AppState: ObservableObject {
                     try EvaluationBundle.linkSharedRuntime(from: runtime.directory, to: evaluationBundleURL)
                 }
 
-                let judgeLimit = max(codexJudgeLimit, 0)
+                let judgeLimit = retryRowID == nil ? max(codexJudgeLimit, 0) : 1
                 let judgeConcurrency = min(max(codexConcurrency, 2), 8)
-                status = "Promptfoo 검증 후 Codex 평가를 시작합니다."
+                status = retryRowID == nil
+                    ? "Promptfoo 검증 후 Codex 평가를 시작합니다."
+                    : "오류 행 1개의 Codex 평가를 다시 실행합니다."
                 let progressTask = Task {
                     await monitorEvaluationProgress(
                         at: evaluationBundleURL.appendingPathComponent("results/codex-judgements.json")
                     )
                 }
                 defer { progressTask.cancel() }
+                var environment = [
+                    "JUDGE_LIMIT": String(judgeLimit),
+                    "CODEX_CONCURRENCY": String(judgeConcurrency),
+                    "CODEX_MODEL": evaluationModel,
+                ]
+                if let retryRowID {
+                    environment["JUDGE_ROW_IDS"] = retryRowID
+                }
                 try await ProcessRunner.run(
                     command: "pnpm",
                     arguments: ["run", "eval"],
                     workingDirectory: evaluationBundleURL,
-                    environment: [
-                        "JUDGE_LIMIT": String(judgeLimit),
-                        "CODEX_CONCURRENCY": String(judgeConcurrency),
-                        "CODEX_MODEL": evaluationModel,
-                    ]
+                    environment: environment
                 )
                 evaluationProgress = evaluationTotal
                 try EvaluationBundle.lockCompletedResults(in: evaluationBundleURL)
@@ -1269,15 +1547,36 @@ final class AppState: ObservableObject {
                 evaluationSummary = summary
                 selectedEvaluationResultID = evaluationBundleURL.lastPathComponent
                 refreshEvaluationResults(silent: true)
-                if summary.codexErrors == 0 {
+                if retryRowID != nil {
+                    status = "오류 평가 행을 재실행해 기존 평가 로그에 반영했습니다."
+                } else if summary.codexErrors == 0 {
                     status = "평가를 완료했습니다. Codex 평균 점수: \(formattedScore(summary.codexAverageScore))"
                 } else {
                     status = "평가를 완료했지만 Codex 판정 \(summary.codexErrors)건이 실패했습니다."
                 }
+                notify(status)
             } catch {
                 status = error.localizedDescription
             }
             isEvaluating = false
+            activeEvaluationRun = nil
+        }
+    }
+
+    func retryEvaluationJudgement(_ judgement: CodexJudgementRecord, in result: EvaluationResultRecord) {
+        guard !isEvaluating, judgement.judge == nil else { return }
+        do {
+            try EvaluationBundle.unlockCompletedResults(in: result.folderURL)
+            evaluationBundleURL = result.folderURL
+            evaluationSummary = nil
+            evaluationProgress = 0
+            evaluationTotal = 1
+            selectedEvaluationResultID = result.id
+            evaluationRetryRowID = judgement.rowId
+            status = "오류 평가 행을 기존 로그에서 재실행합니다."
+            runEvaluation()
+        } catch {
+            status = "오류 행 평가 재실행 준비 실패: \(error.localizedDescription)"
         }
     }
 
@@ -1410,6 +1709,7 @@ final class AppState: ObservableObject {
             selectedEvaluationResultID = nil
             refreshEvaluationResults(silent: true)
             status = "평가 결과를 삭제했습니다."
+            notify(status)
         } catch {
             status = "평가 결과를 삭제하지 못했습니다: \(error.localizedDescription)"
         }
@@ -1439,11 +1739,15 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func executeTestRun(testCase: SavedTestCase, dataset: SavedDataset, count: Int) async {
+    private func executeTestRun(
+        testCase: SavedTestCase,
+        dataset: SavedDataset,
+        count: Int,
+        runID: UUID,
+        startedAt: Date
+    ) async {
         isTestRunning = true
         progress = 0
-        let startedAt = Date()
-        let runID = UUID()
         let sourceRows = Array(dataset.rows.prefix(count))
         let runProvider = ProviderKind(rawValue: testCase.provider) ?? .gemini
         let apiKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1461,6 +1765,8 @@ final class AppState: ObservableObject {
                     rowID: row.id,
                     variables: dictionary(row.values, keys: PromptTemplate.variables(in: testCase.prompt)),
                     expectedValues: dictionaryExcluding(row.values, keys: PromptTemplate.variables(in: testCase.prompt)),
+                    displayDatasetValues: dictionary(row.values, keys: testCase.displayDatasetFields ?? []),
+                    displayOutputValues: [:],
                     criterionResults: [],
                     latencyMilliseconds: 0,
                     inputTokens: nil,
@@ -1511,6 +1817,8 @@ final class AppState: ObservableObject {
                     rowID: row.id,
                     variables: dictionary(row.values, keys: variableFields),
                     expectedValues: dictionaryExcluding(row.values, keys: variableFields),
+                    displayDatasetValues: dictionary(row.values, keys: testCase.displayDatasetFields ?? []),
+                    displayOutputValues: outputDisplayValues(result.output, paths: testCase.displayOutputPaths ?? []),
                     criterionResults: criteriaResults,
                     latencyMilliseconds: result.latencyMilliseconds,
                     inputTokens: result.inputTokens,
@@ -1546,6 +1854,8 @@ final class AppState: ObservableObject {
             provider: testCase.provider,
             modelID: testCase.modelID,
             criteria: testCase.criteria,
+            displayDatasetFields: testCase.displayDatasetFields,
+            displayOutputPaths: testCase.displayOutputPaths,
             requestedCount: count,
             status: wasCancelled ? .cancelled : .completed,
             startedAt: startedAt,
@@ -1563,10 +1873,12 @@ final class AppState: ObservableObject {
             status = wasCancelled
                 ? "테스트를 취소하고 완료된 \(resultRows.count)개 행을 별도 결과로 저장했습니다."
                 : "테스트 \(count)개 행을 완료하고 데이터셋과 분리된 결과 파일로 저장했습니다."
+            notify(status)
         } catch {
             status = "테스트 결과 저장 실패: \(error.localizedDescription)"
         }
         isTestRunning = false
+        activeTestRun = nil
         activeTestRunTask = nil
     }
 
@@ -1639,6 +1951,13 @@ final class AppState: ObservableObject {
 
     private func dictionaryExcluding(_ values: [String: String], keys: [String]) -> [String: String] {
         values.filter { !keys.contains($0.key) }
+    }
+
+    private func outputDisplayValues(_ output: String?, paths: [String]) -> [String: String] {
+        guard let output, !paths.isEmpty else { return [:] }
+        return Dictionary(uniqueKeysWithValues: paths.map { path in
+            (path, JSONValueExtractor.value(at: path, in: output) ?? "")
+        })
     }
 
     private func testRunName(_ testCaseName: String, date: Date) -> String {
